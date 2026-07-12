@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Cover Letter Settings</title>
+<style>
+  :root {
+    --bg: #f5f1e8;
+    --card-bg: #fffdf9;
+    --border: #e2dbc9;
+    --text: #2c2a24;
+    --text-muted: #7a7566;
+    --accent: #3a5a48;
+    --accent-hover: #2d4738;
+  }
+  * { box-sizing: border-box; }
+  body {
+    width: 380px;
+    margin: 0;
+    background: var(--bg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    color: var(--text);
+  }
+  .container {
+    padding: 18px;
+  }
+  h1 {
+    font-size: 15px;
+    font-weight: 700;
+    margin: 0 0 4px;
+    letter-spacing: -0.01em;
+  }
+  .subtitle {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin: 0 0 16px;
+  }
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: 0 1px 3px rgba(44, 42, 36, 0.06);
+    padding: 14px;
+    margin-bottom: 12px;
+  }
+  label {
+    display: block;
+    font-size: 12.5px;
+    font-weight: 600;
+    margin-bottom: 4px;
+    color: var(--text);
+  }
+  .help {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin: 0 0 8px;
+    line-height: 1.4;
+  }
+  .help a {
+    color: var(--accent);
+  }
+  input[type="text"],
+  input[type="password"],
+  textarea {
+    width: 100%;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 13px;
+    font-family: inherit;
+    background: #fff;
+    color: var(--text);
+    resize: vertical;
+  }
+  input:focus, textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  textarea.resume {
+    min-height: 150px;
+  }
+  textarea.context {
+    min-height: 70px;
+  }
+  .save-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 4px;
+  }
+  button.save-btn {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 9px 18px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+  button.save-btn:hover {
+    background: var(--accent-hover);
+  }
+  .saved-msg {
+    font-size: 12px;
+    color: var(--accent);
+    font-weight: 600;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+  }
+  .saved-msg.show {
+    opacity: 1;
+  }
+</style>
+</head>
+<body>
+  <div class="container">
+    <h1>Handshake Instant Cover Letter</h1>
+    <p class="subtitle">Set this up once — used every time you generate a letter.</p>
+
+    <div class="card">
+      <label for="yourName">Your name</label>
+      <p class="help">Used to name the downloaded PDF file.</p>
+      <input type="text" id="yourName" placeholder="Jane Doe" />
+    </div>
+
+    <div class="card">
+      <label for="resumeText">Resume</label>
+      <p class="help">Paste your full resume text, not a summary — the more specific it is, the more specific the generated letter will be.</p>
+      <textarea id="resumeText" class="resume" placeholder="Paste your entire resume here..."></textarea>
+    </div>
+
+    <div class="card">
+      <label for="extraContext">Extra context (optional)</label>
+      <p class="help">Anything not on your resume worth mentioning — specific project details, why you're job hunting, notable coursework, etc.</p>
+      <textarea id="extraContext" class="context" placeholder="Anything not on your resume worth mentioning..."></textarea>
+    </div>
+
+    <div class="card">
+      <label for="githubUsername">GitHub username</label>
+      <p class="help">Optional — lets the letter reference a specific recent project if it's a stronger match than your resume.</p>
+      <input type="text" id="githubUsername" placeholder="octocat" />
+    </div>
+
+    <div class="card">
+      <label for="apiKey">Anthropic API key</label>
+      <p class="help">Get a key at <a href="https://console.anthropic.com" target="_blank" rel="noopener">console.anthropic.com</a>. Stored locally in your browser only — never sent anywhere except directly to Anthropic's API.</p>
+      <input type="password" id="apiKey" placeholder="sk-ant-..." />
+    </div>
+
+    <div class="save-row">
+      <button class="save-btn" id="saveBtn">Save</button>
+      <span class="saved-msg" id="savedMsg">Saved</span>
+    </div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

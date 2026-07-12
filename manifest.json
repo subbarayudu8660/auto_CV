@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "Handshake Instant Cover Letter",
+  "version": "1.0.0",
+  "description": "Generate a tailored cover letter PDF from any Handshake job posting using your saved resume and the Claude API.",
+  "permissions": ["storage", "activeTab", "scripting"],
+  "host_permissions": [
+    "https://*.joinhandshake.com/*",
+    "https://api.anthropic.com/*",
+    "https://api.github.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*.joinhandshake.com/*"],
+      "js": ["jspdf.umd.min.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}
