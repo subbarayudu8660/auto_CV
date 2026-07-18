@@ -112,6 +112,99 @@
   .saved-msg.show {
     opacity: 1;
   }
+  h2 {
+    font-size: 13.5px;
+    font-weight: 700;
+    margin: 0 0 4px;
+  }
+  .row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .row > div {
+    flex: 1;
+  }
+  .field {
+    margin-bottom: 8px;
+  }
+  .entry {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    margin-bottom: 8px;
+    background: #fbfaf6;
+  }
+  .entry-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+  }
+  .entry-head span {
+    font-size: 11.5px;
+    font-weight: 700;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  button.remove-btn {
+    background: none;
+    border: none;
+    color: #a33;
+    font-size: 11.5px;
+    cursor: pointer;
+    padding: 2px 4px;
+  }
+  button.add-btn {
+    background: none;
+    border: 1px dashed var(--border);
+    color: var(--accent);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    width: 100%;
+  }
+  textarea.bullets {
+    min-height: 60px;
+  }
+  details.import-escape {
+    margin-top: 4px;
+  }
+  details.import-escape summary {
+    font-size: 11.5px;
+    color: var(--accent);
+    cursor: pointer;
+    font-weight: 600;
+  }
+  textarea.import-json {
+    min-height: 90px;
+    margin-top: 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+  }
+  .import-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 6px;
+  }
+  button.import-btn {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .import-error {
+    font-size: 11px;
+    color: #a33;
+  }
 </style>
 </head>
 <body>
@@ -152,6 +245,113 @@
     <div class="save-row">
       <button class="save-btn" id="saveBtn">Save</button>
       <span class="saved-msg" id="savedMsg">Saved</span>
+    </div>
+
+    <h1 style="margin-top: 24px;">Resume Tailoring</h1>
+    <p class="subtitle">Separate structured resume used only by the tailoring feature — not the plain-text resume above.</p>
+
+    <div class="card">
+      <h2>Basics</h2>
+      <div class="field">
+        <label for="rjName">Name</label>
+        <input type="text" id="rjName" placeholder="Jane Doe" />
+      </div>
+      <div class="row">
+        <div class="field">
+          <label for="rjEmail">Email</label>
+          <input type="text" id="rjEmail" placeholder="jane@example.com" />
+        </div>
+        <div class="field">
+          <label for="rjPhone">Phone</label>
+          <input type="text" id="rjPhone" placeholder="555-123-4567" />
+        </div>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label for="rjLocation">Location</label>
+          <input type="text" id="rjLocation" placeholder="Austin, TX" />
+        </div>
+        <div class="field">
+          <label for="rjLinkedin">LinkedIn</label>
+          <input type="text" id="rjLinkedin" placeholder="linkedin.com/in/janedoe" />
+        </div>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label for="rjGithub">GitHub</label>
+          <input type="text" id="rjGithub" placeholder="github.com/janedoe" />
+        </div>
+        <div class="field">
+          <label for="rjPortfolio">Portfolio</label>
+          <input type="text" id="rjPortfolio" placeholder="janedoe.dev" />
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Summary</h2>
+      <textarea id="rjSummary" class="context" placeholder="Short professional summary..."></textarea>
+    </div>
+
+    <div class="card">
+      <h2>Skills</h2>
+      <p class="help">Comma-separated.</p>
+      <textarea id="rjSkills" class="context" placeholder="Python, SQL, Tableau, ..."></textarea>
+    </div>
+
+    <div class="card">
+      <h2>Experience</h2>
+      <div id="rjExperienceList"></div>
+      <button type="button" class="add-btn" id="rjAddExperience">+ Add experience entry</button>
+    </div>
+
+    <div class="card">
+      <h2>Projects</h2>
+      <div id="rjProjectsList"></div>
+      <button type="button" class="add-btn" id="rjAddProject">+ Add project entry</button>
+    </div>
+
+    <div class="card">
+      <h2>Education</h2>
+      <div class="row">
+        <div class="field">
+          <label for="rjEduSchool">School</label>
+          <input type="text" id="rjEduSchool" placeholder="State University" />
+        </div>
+        <div class="field">
+          <label for="rjEduDegree">Degree</label>
+          <input type="text" id="rjEduDegree" placeholder="B.S. Computer Science" />
+        </div>
+      </div>
+      <div class="field">
+        <label for="rjEduDates">Dates</label>
+        <input type="text" id="rjEduDates" placeholder="2020 - 2024" />
+      </div>
+      <div class="field">
+        <label for="rjEduDetails">Details (optional)</label>
+        <input type="text" id="rjEduDetails" placeholder="GPA, honors, relevant coursework..." />
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Source resume filename</h2>
+      <p class="help">The filename of your current resume PDF (e.g. Subbu_Rayudu_Resume_DA.pdf) — used only to infer the naming pattern for tailored resume downloads, not the file itself.</p>
+      <input type="text" id="rjSourceFilename" placeholder="Subbu_Rayudu_Resume_DA.pdf" />
+
+      <details class="import-escape">
+        <summary>Import from JSON instead</summary>
+        <p class="help">Paste a full resumeJson object matching the schema — this overwrites all fields above.</p>
+        <textarea id="rjImportJson" class="import-json" placeholder='{"name": "...", "contact": {...}, "skills": [...], "experience": [...], ...}'></textarea>
+        <div class="import-row">
+          <button type="button" class="import-btn" id="rjImportBtn">Import</button>
+          <span class="import-error" id="rjImportError"></span>
+        </div>
+      </details>
+    </div>
+
+    <div class="save-row">
+      <button class="save-btn" id="rjSaveBtn">Save structured resume</button>
+      <span class="saved-msg" id="rjSavedMsg">Saved</span>
     </div>
   </div>
   <script src="popup.js"></script>
