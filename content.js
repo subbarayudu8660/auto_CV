@@ -135,6 +135,12 @@ function buildUI() {
     .status { font-size: 13px; color: #7a7566; margin-bottom: 10px; }
     .error-msg { font-size: 12.5px; color: #a33; margin-bottom: 10px; line-height: 1.4; }
     .filename { font-size: 12.5px; color: #2c2a24; margin-bottom: 10px; word-break: break-all; }
+    .changes-summary { font-size: 12px; margin-bottom: 10px; max-height: 220px; overflow-y: auto; }
+    .changes-summary summary { cursor: pointer; font-weight: 600; margin-bottom: 6px; }
+    .change-row { border-top: 1px solid #e2dbc9; padding: 6px 0; }
+    .change-entry { font-weight: 600; color: #46467a; margin-bottom: 2px; }
+    .change-before { color: #7a7566; text-decoration: line-through; margin-bottom: 2px; }
+    .change-after { color: #2c2a24; }
     textarea.manual-paste {
       width: 100%;
       min-height: 100px;
@@ -525,10 +531,29 @@ function renderChecklist(container, skills, onContinue) {
   });
 }
 
-function renderResumeDownloadSuccess(container, filename, onRestart) {
+function renderResumeDownloadSuccess(container, filename, onRestart, bulletChanges) {
+  const changes = Array.isArray(bulletChanges) ? bulletChanges : [];
+  const changesHtml = changes.length
+    ? `
+    <details class="changes-summary">
+      <summary>${changes.length} bullet${changes.length === 1 ? "" : "s"} rephrased</summary>
+      ${changes
+        .map(
+          (c) => `
+        <div class="change-row">
+          <div class="change-entry">${escapeHtml(c.section)} — ${escapeHtml(c.entry)}</div>
+          <div class="change-before">Before: ${escapeHtml(c.before)}</div>
+          <div class="change-after">After: ${escapeHtml(c.after)}</div>
+        </div>`
+        )
+        .join("")}
+    </details>`
+    : "";
+
   container.innerHTML = `
     <div class="status">Downloaded:</div>
     <div class="filename">${escapeHtml(filename)}</div>
+    ${changesHtml}
     <button class="secondary-btn" id="resume-restart-btn">Start Over</button>
   `;
   container.querySelector("#resume-restart-btn").addEventListener("click", () => onRestart(container));
@@ -686,15 +711,39 @@ function drawResumePdf(resumeJson, fontSizePt) {
   doc.text(resumeJson.name || "", PDF_PAGE_WIDTH_PT / 2, cursorY, { align: "center" });
   cursorY += (fontSizePt + 6) * 1.2;
 
+  // Contact line: measure before drawing rather than letting a long line of
+  // email/phone/links run off the page edge. If it's too wide for the
+  // content width, split into two lines (location paired with the name up
+  // top, the rest below) instead of shrinking the font.
   const contact = resumeJson.contact || {};
-  const contactLine = [contact.email, contact.phone, contact.location, contact.linkedin, contact.github, contact.portfolio]
-    .filter(Boolean)
-    .join("   |   ");
-  if (contactLine) {
-    doc.setFont("Helvetica", "normal");
-    doc.setFontSize(smallPt);
-    doc.text(contactLine, PDF_PAGE_WIDTH_PT / 2, cursorY, { align: "center" });
-    cursorY += smallPt * 1.3;
+  doc.setFont("Helvetica", "normal");
+  doc.setFontSize(smallPt);
+
+  function drawCenteredContactLine(text) {
+    if (!text) return;
+    if (doc.getTextWidth(text) <= PDF_CONTENT_WIDTH_PT) {
+      doc.text(text, PDF_PAGE_WIDTH_PT / 2, cursorY, { align: "center" });
+      cursorY += smallPt * 1.3;
+      return;
+    }
+    // Still too wide even as its own line (e.g. many long links) — wrap it
+    // rather than let it overflow.
+    doc.splitTextToSize(text, PDF_CONTENT_WIDTH_PT).forEach((line) => {
+      doc.text(line, PDF_PAGE_WIDTH_PT / 2, cursorY, { align: "center" });
+      cursorY += smallPt * 1.3;
+    });
+  }
+
+  const contactFieldsFull = [contact.email, contact.phone, contact.location, contact.linkedin, contact.github, contact.portfolio].filter(Boolean);
+  const contactLineFull = contactFieldsFull.join("   |   ");
+
+  if (contactLineFull && doc.getTextWidth(contactLineFull) <= PDF_CONTENT_WIDTH_PT) {
+    drawCenteredContactLine(contactLineFull);
+  } else {
+    const line1 = [contact.location].filter(Boolean).join("   |   ");
+    const line2 = [contact.email, contact.phone, contact.linkedin, contact.github, contact.portfolio].filter(Boolean).join("   |   ");
+    drawCenteredContactLine(line1);
+    drawCenteredContactLine(line2);
   }
 
   if (resumeJson.summary) {
@@ -811,7 +860,7 @@ async function runTailorResumeFlow(container, jobDescriptionText, approvedSkills
       if (statusEl && statusEl.isConnected) statusEl.textContent = msg;
     });
     stopLoading();
-    renderResumeDownloadSuccess(container, filename, runResumeTailorFlow);
+    renderResumeDownloadSuccess(container, filename, runResumeTailorFlow, response.bulletChanges);
   } catch (err) {
     stopLoading();
     renderError(container, `Failed to build the tailored resume PDF: ${err.message}`, runResumeTailorFlow);

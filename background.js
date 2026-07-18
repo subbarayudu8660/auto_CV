@@ -37,6 +37,19 @@ const WEB_SEARCH_TIMEOUT_MS = 55000;
 // (it's awaited before the Claude call even starts).
 const GITHUB_FETCH_TIMEOUT_MS = 10000;
 
+// Strips a stray trailing hyphen (e.g. "PEFT-") that PDF text extraction can
+// leave behind from a justified-text line-wrap artifact in the source PDF's
+// text layer — never a valid ending for a real skill name, so safe to trim
+// unconditionally. Applied everywhere a resumeJson comes back from Claude
+// (extraction, tailoring, compression) since any of those round trips could
+// carry it forward from the original extracted data.
+function sanitizeSkillsArray(skills) {
+  if (!Array.isArray(skills)) return skills;
+  return skills
+    .map((s) => (typeof s === "string" ? s.trim().replace(/-+$/, "").trim() : s))
+    .filter((s) => s !== "" && s !== null && s !== undefined);
+}
+
 async function fetchGithubReposBlock(githubUsername) {
   if (!githubUsername) return "";
 
@@ -313,6 +326,8 @@ Extract this resume into the JSON schema now, following the system instructions 
     return { success: false, error: "Claude's response wasn't valid JSON, so it couldn't be parsed into the resume form. Try again, or paste the resume text manually instead of uploading the PDF." };
   }
 
+  resumeJson.skills = sanitizeSkillsArray(resumeJson.skills);
+
   return { success: true, resumeJson };
 }
 
@@ -446,7 +461,7 @@ Analyze now, following the system instructions exactly.`;
 
 const TAILOR_RESUME_SYSTEM_PROMPT = `You are tailoring a real person's resume to a specific job description. This is a rewrite pass with one absolute boundary: you are editing what already exists, never inventing what doesn't.
 
-CRITICAL RULE, THE MOST IMPORTANT ONE IN THIS PROMPT: Never add a new entry to "experience" or "projects." Every entry in the output arrays must correspond to an entry that was already in the input resume — same title/org or same project name. Within an existing entry, you may rephrase, reorder, or expand its existing bullets (and only its existing bullets), but you may not invent a bullet describing work, a tool, or a result that has no basis in the input. If the job description calls for something the resume has zero evidence for anywhere, leave it out of the bullets entirely — it can only go into "skills" (see below), never fabricated into a bullet as if it were experience.
+CRITICAL RULE, THE MOST IMPORTANT ONE IN THIS PROMPT — STRUCTURAL, NOT JUST ADVISORY: Every entry in the output "experience" array must correspond 1:1, in the same order, to an entry in the input "experience" array (same title/org) — same length, same order, no additions, no omissions. Same for "projects". Within each entry, the output "bullets" array must contain EXACTLY the same number of bullets as the input entry's "bullets" array, in the same order: output bullet[i] is a rephrased/expanded version of input bullet[i], describing the SAME underlying fact or claim, never a different one. You may not add a bullet, remove a bullet, merge two bullets into one, split one bullet into two, or swap a bullet's underlying claim for a different claim. Before you finalize your output, count the bullets in each entry against the input and confirm the counts match exactly — a mismatched count means you fabricated or dropped content, which is not allowed under any circumstance, even if the added claim sounds plausible or the job description would benefit from it. If the job description calls for something the resume has zero evidence for anywhere, leave it out of the bullets entirely — it can only go into "skills" (see below), never fabricated into a bullet as if it were experience.
 
 Bad (inventing a new project to chase the JD):
 Input resume has 2 projects. Job description mentions Kubernetes, which appears nowhere in the input.
@@ -455,6 +470,14 @@ Bad output: a 3rd project entry, "Container Orchestration Pipeline," that doesn'
 Bad (fabricating within an existing bullet):
 Input bullet: "Built a dashboard in Tableau for the sales team"
 Bad output: "Built a dashboard in Tableau and deployed it via a Kubernetes-orchestrated CI/CD pipeline for the sales team" (the Kubernetes/CI/CD part has no basis anywhere in the input resume)
+
+Bad (adding a new bullet to an entry, changing its bullet count):
+Input entry "WebrocketAI" has 3 bullets about ReportGen, Feed Signal, and a discovery pipeline.
+Bad output: the same entry now has 5 bullets — the original 3, plus a new 4th bullet claiming a RAG/pgvector workflow and a new 5th bullet claiming LLM agent evaluation, neither of which appears anywhere in the input. Even though both new bullets are individually plausible-sounding and relevant to the JD, this is fabrication: the entry's bullet count changed from 3 to 5.
+
+Bad (replacing a bullet's claim instead of rephrasing it):
+Input bullet: "Kept structured intelligence reports enriched with keyword tags for downstream search"
+Bad output: "Implemented structured logging and evaluation metrics to monitor LLM agent accuracy in production" (this is a wholesale swap to a different, unrelated claim, not a rephrasing of the same fact — the bullet count may look unchanged but the underlying content was fabricated)
 
 Good (rephrasing/expanding an existing bullet using only what's already there, while working in a real JD keyword the resume already supports):
 Input bullet: "Built a dashboard in Tableau for the sales team"
@@ -477,35 +500,9 @@ Other rules:
 
 CRITICAL OUTPUT FORMAT: You may reason through your approach first if needed. But the final result must be wrapped in <resume_json></resume_json> tags with absolutely nothing else inside those tags except the raw JSON object: no markdown code fences, no commentary. Everything outside the tags is discarded, so use that space for any reasoning, but the content inside <resume_json></resume_json> must be valid JSON matching the same schema as the input resume exactly.`;
 
-async function tailorResume({ jobDescriptionText, approvedSkills }) {
-  const stored = await chrome.storage.local.get(["apiKey", "resumeJson"]);
-  const { apiKey, resumeJson } = stored;
-
-  if (!apiKey) {
-    return { success: false, error: "No Anthropic API key saved. Open the extension popup and add your API key in settings." };
-  }
-  if (!resumeJson || !resumeJson.name) {
-    return { success: false, error: "No structured resume saved. Open the extension popup and fill in (or auto-extract) your resume under Resume Tailoring." };
-  }
-  if (!jobDescriptionText || !jobDescriptionText.trim()) {
-    return { success: false, error: "No job description text found on this page." };
-  }
-
-  const approvedSkillsList = Array.isArray(approvedSkills) ? approvedSkills : [];
-  const approvedSkillsText = approvedSkillsList.length ? approvedSkillsList.join(", ") : "None approved";
-
-  const userMessage = `<job_description>
-${jobDescriptionText}
-</job_description>
-<resume_json>
-${JSON.stringify(resumeJson)}
-</resume_json>
-<approved_new_skills>
-${approvedSkillsText}
-</approved_new_skills>
-
-Tailor this resume now, following the system instructions exactly.`;
-
+// Shared by tailorResume()'s initial call and its one-shot correction retry.
+// Returns { success:true, resumeJson } or { success:false, error }.
+async function callClaudeForTailoredResume(apiKey, userMessage) {
   let response;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
@@ -578,12 +575,134 @@ Tailor this resume now, following the system instructions exactly.`;
     return { success: false, error: "Claude's response wasn't valid JSON, so the tailored resume couldn't be parsed. Try again." };
   }
 
+  return { success: true, resumeJson: tailoredResumeJson };
+}
+
+// Structural safety net for the system prompt's bullet-count rule: an LLM
+// can be told not to fabricate and still do it, so this actually counts
+// bullets per entry (matched by index, since order must be preserved) rather
+// than trusting the model's compliance. Returns human-readable mismatch
+// descriptions, used both to decide validity and to build the retry's
+// correction message.
+function validateBulletCounts(original, tailored) {
+  const mismatches = [];
+
+  function checkSection(sectionLabel, origList, tailList, labelFor) {
+    const origArr = Array.isArray(origList) ? origList : [];
+    const tailArr = Array.isArray(tailList) ? tailList : [];
+    if (origArr.length !== tailArr.length) {
+      mismatches.push(`${sectionLabel}: expected ${origArr.length} entries, got ${tailArr.length}`);
+      return;
+    }
+    origArr.forEach((origEntry, i) => {
+      const tailEntry = tailArr[i] || {};
+      const origBullets = Array.isArray(origEntry.bullets) ? origEntry.bullets : [];
+      const tailBullets = Array.isArray(tailEntry.bullets) ? tailEntry.bullets : [];
+      if (origBullets.length !== tailBullets.length) {
+        mismatches.push(`${labelFor(origEntry)}: expected ${origBullets.length} bullets, got ${tailBullets.length}`);
+      }
+    });
+  }
+
+  checkSection(
+    "experience",
+    original.experience,
+    tailored.experience,
+    (e) => [e.title, e.org].filter(Boolean).join(" @ ") || "an experience entry"
+  );
+  checkSection("projects", original.projects, tailored.projects, (e) => e.name || "a project entry");
+
+  return { valid: mismatches.length === 0, mismatches };
+}
+
+// Bullet-by-bullet before/after diff, only meaningful once validateBulletCounts
+// has confirmed counts line up 1:1 by index — feeds the changes-summary shown
+// to the user alongside the download.
+function buildBulletChanges(original, tailored) {
+  const changes = [];
+
+  function collect(sectionLabel, origList, tailList, labelFor) {
+    (Array.isArray(origList) ? origList : []).forEach((origEntry, i) => {
+      const tailEntry = (Array.isArray(tailList) ? tailList : [])[i];
+      if (!tailEntry) return;
+      const entryLabel = labelFor(origEntry);
+      (Array.isArray(origEntry.bullets) ? origEntry.bullets : []).forEach((origBullet, j) => {
+        const tailBullet = (Array.isArray(tailEntry.bullets) ? tailEntry.bullets : [])[j];
+        if (tailBullet !== undefined && tailBullet !== origBullet) {
+          changes.push({ section: sectionLabel, entry: entryLabel, before: origBullet, after: tailBullet });
+        }
+      });
+    });
+  }
+
+  collect("Experience", original.experience, tailored.experience, (e) => [e.title, e.org].filter(Boolean).join(", ") || "Experience entry");
+  collect("Projects", original.projects, tailored.projects, (e) => e.name || "Project entry");
+
+  return changes;
+}
+
+async function tailorResume({ jobDescriptionText, approvedSkills }) {
+  const stored = await chrome.storage.local.get(["apiKey", "resumeJson"]);
+  const { apiKey, resumeJson } = stored;
+
+  if (!apiKey) {
+    return { success: false, error: "No Anthropic API key saved. Open the extension popup and add your API key in settings." };
+  }
+  if (!resumeJson || !resumeJson.name) {
+    return { success: false, error: "No structured resume saved. Open the extension popup and fill in (or auto-extract) your resume under Resume Tailoring." };
+  }
+  if (!jobDescriptionText || !jobDescriptionText.trim()) {
+    return { success: false, error: "No job description text found on this page." };
+  }
+
+  const approvedSkillsList = Array.isArray(approvedSkills) ? approvedSkills : [];
+  const approvedSkillsText = approvedSkillsList.length ? approvedSkillsList.join(", ") : "None approved";
+
+  const userMessage = `<job_description>
+${jobDescriptionText}
+</job_description>
+<resume_json>
+${JSON.stringify(resumeJson)}
+</resume_json>
+<approved_new_skills>
+${approvedSkillsText}
+</approved_new_skills>
+
+Tailor this resume now, following the system instructions exactly.`;
+
+  let result = await callClaudeForTailoredResume(apiKey, userMessage);
+  if (!result.success) return result;
+
+  let validation = validateBulletCounts(resumeJson, result.resumeJson);
+
+  if (!validation.valid) {
+    const correctionMessage = `${userMessage}
+
+Your last output added or removed bullets, which is not allowed. Rewrite preserving the exact bullet count per entry. Specifically, these entries did not match the input's bullet count: ${validation.mismatches.join("; ")}. Every experience and project entry must have exactly the same number of bullets as the corresponding input entry, in the same order.`;
+
+    result = await callClaudeForTailoredResume(apiKey, correctionMessage);
+    if (!result.success) return result;
+
+    validation = validateBulletCounts(resumeJson, result.resumeJson);
+    if (!validation.valid) {
+      return {
+        success: false,
+        error: `The tailored resume kept adding or removing bullets instead of just rephrasing them (${validation.mismatches.join("; ")}), so it was discarded rather than risk showing you fabricated content. Try again, or try a different job description.`
+      };
+    }
+  }
+
+  const tailoredResumeJson = result.resumeJson;
+
   // Belt-and-suspenders: guarantee these pass through unchanged regardless of
   // what the model actually did, since sourceFilename in particular feeds
   // the download filename downstream.
   tailoredResumeJson.sourceFilename = resumeJson.sourceFilename || tailoredResumeJson.sourceFilename || "";
+  tailoredResumeJson.skills = sanitizeSkillsArray(tailoredResumeJson.skills);
 
-  return { success: true, resumeJson: tailoredResumeJson };
+  const bulletChanges = buildBulletChanges(resumeJson, tailoredResumeJson);
+
+  return { success: true, resumeJson: tailoredResumeJson, bulletChanges };
 }
 
 const COMPRESS_RESUME_SYSTEM_PROMPT = `You are tightening an already-tailored resume so it fits on one printed page. This is a compression pass only, not a rewrite.
@@ -687,6 +806,7 @@ Tighten the bullets now by about 15%, following the system instructions exactly.
   }
 
   compressedResumeJson.sourceFilename = resumeJson.sourceFilename || compressedResumeJson.sourceFilename || "";
+  compressedResumeJson.skills = sanitizeSkillsArray(compressedResumeJson.skills);
 
   return { success: true, resumeJson: compressedResumeJson };
 }
