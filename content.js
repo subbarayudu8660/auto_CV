@@ -579,8 +579,21 @@ async function runResumeAnalysisWithDescription(container, jobDescriptionText) {
 
 // ----------------------------------------------------------------------------
 // E. Tailored resume render + one-page PDF (this feature's own path — does
-// not touch jspdf.umd.min.js or buildAndDownloadPdf() above, which stay
-// dedicated to the cover letter. Uses html2pdf.js, bundled locally.)
+// not touch jspdf.umd.min.js's usage above in buildAndDownloadPdf(), which
+// stays dedicated to the cover letter; this uses its own separate jsPDF
+// document instance).
+//
+// NOTE — tried and reverted: this used to render via html2pdf.js (which
+// screenshots a cloned DOM element through html2canvas). On Handshake that
+// clone-into-a-hidden-iframe approach triggers the PAGE'S OWN CSP against
+// loading Handshake's own <script> tags inside the clone, which silently
+// fails the render and produces a blank PDF — a structural incompatibility
+// with any CSP-restrictive host page, not a config bug. Fixed by drawing the
+// resume directly with jsPDF's vector text/line APIs instead (no DOM clone,
+// no iframe, no script loading — sidesteps the CSP entirely, and produces
+// sharp vector text instead of a raster image, which is also better for ATS
+// parsing). See CLAUDE.md for the full writeup. html2pdf.js/html2canvas is
+// no longer a dependency of this feature.
 // ----------------------------------------------------------------------------
 const TAILOR_LOADING_MESSAGES = [
   "Reading the job description...",
@@ -588,12 +601,13 @@ const TAILOR_LOADING_MESSAGES = [
   "Making sure it still fits one page..."
 ];
 
-// 8.5x11in at 96dpi, per the one-page spec. Margin is baked into the page
-// element's padding rather than passed to html2pdf's own margin option, so
-// the same box is what gets measured AND what gets rendered.
-const RESUME_PAGE_WIDTH_PX = 816;
-const RESUME_PAGE_HEIGHT_PX = 1056;
-const RESUME_MARGIN_PX = 48; // 0.5in
+// Letter page in points (jsPDF's font-size unit), so page math and font math
+// share one unit — no px<->pt conversion to keep in sync. 1in = 72pt.
+const PDF_PAGE_WIDTH_PT = 612; // 8.5in
+const PDF_PAGE_HEIGHT_PT = 792; // 11in
+const PDF_MARGIN_PT = 36; // 0.5in
+const PDF_CONTENT_WIDTH_PT = PDF_PAGE_WIDTH_PT - PDF_MARGIN_PT * 2;
+const PDF_BOTTOM_Y_PT = PDF_PAGE_HEIGHT_PT - PDF_MARGIN_PT;
 const RESUME_FONT_FLOOR_PT = 10;
 
 function requestTailorResume({ jobDescriptionText, approvedSkills }) {
@@ -610,140 +624,159 @@ function requestCompressResume({ resumeJson }) {
   );
 }
 
-function resumeSectionHeadingHtml(text, fontSizePt) {
-  return `<div style="font-size:${fontSizePt}pt;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;border-bottom:1px solid #333;margin:12px 0 6px;padding-bottom:2px;">${escapeHtml(text)}</div>`;
-}
-
-// Generic single-column ATS-safe layout — no tables, no icons, no columns.
-// There's no real visual spec to match yet; this is a placeholder to replace
-// once one is provided (see CLAUDE.md).
-function buildResumeHtml(resumeJson, fontSizePt) {
+// Draws the resume into a fresh jsPDF document and reports whether the
+// cursor ran past the bottom margin (the one-page overflow check —
+// jsPDF has no rendered DOM to measure, so this tracks cursor position
+// instead of scrollHeight). Generic single-column ATS-safe layout — no
+// tables, no icons, no columns. There's no real visual spec to match yet;
+// this is a placeholder to replace once one is provided (see CLAUDE.md).
+function drawResumePdf(resumeJson, fontSizePt) {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: "pt", format: "letter" });
   const smallPt = Math.max(fontSizePt - 1, RESUME_FONT_FLOOR_PT - 1);
+  let cursorY = PDF_MARGIN_PT;
+
+  function addWrappedText(text, size, style = "normal") {
+    doc.setFont("Helvetica", style);
+    doc.setFontSize(size);
+    doc.splitTextToSize(text, PDF_CONTENT_WIDTH_PT).forEach((line) => {
+      doc.text(line, PDF_MARGIN_PT, cursorY);
+      cursorY += size * 1.3;
+    });
+  }
+
+  function addBullets(bullets, size) {
+    const indent = 12;
+    doc.setFont("Helvetica", "normal");
+    doc.setFontSize(size);
+    (bullets || []).forEach((bullet) => {
+      const lines = doc.splitTextToSize(`• ${bullet}`, PDF_CONTENT_WIDTH_PT - indent);
+      lines.forEach((line, i) => {
+        doc.text(line, PDF_MARGIN_PT + (i === 0 ? 0 : indent), cursorY);
+        cursorY += size * 1.3;
+      });
+    });
+  }
+
+  function addSectionHeading(title) {
+    cursorY += 6;
+    doc.setFont("Helvetica", "bold");
+    doc.setFontSize(fontSizePt);
+    doc.text(title.toUpperCase(), PDF_MARGIN_PT, cursorY);
+    cursorY += 3;
+    doc.setLineWidth(0.75);
+    doc.line(PDF_MARGIN_PT, cursorY, PDF_MARGIN_PT + PDF_CONTENT_WIDTH_PT, cursorY);
+    cursorY += fontSizePt;
+  }
+
+  function addEntryHeadingRow(leftText, rightText, size) {
+    doc.setFont("Helvetica", "bold");
+    doc.setFontSize(size);
+    doc.text(leftText, PDF_MARGIN_PT, cursorY);
+    if (rightText) {
+      doc.setFont("Helvetica", "normal");
+      doc.text(rightText, PDF_MARGIN_PT + PDF_CONTENT_WIDTH_PT, cursorY, { align: "right" });
+    }
+    cursorY += size * 1.3;
+  }
+
+  // Header: name + contact line, centered.
+  doc.setFont("Helvetica", "bold");
+  doc.setFontSize(fontSizePt + 6);
+  doc.text(resumeJson.name || "", PDF_PAGE_WIDTH_PT / 2, cursorY, { align: "center" });
+  cursorY += (fontSizePt + 6) * 1.2;
+
   const contact = resumeJson.contact || {};
   const contactLine = [contact.email, contact.phone, contact.location, contact.linkedin, contact.github, contact.portfolio]
     .filter(Boolean)
-    .map(escapeHtml)
-    .join("  |  ");
-
-  let html = `<div style="font-family: Arial, Helvetica, sans-serif; font-size:${fontSizePt}pt; line-height:1.35; color:#111;">`;
-
-  html += `<div style="text-align:center; margin-bottom:10px;">
-    <div style="font-size:${fontSizePt + 6}pt; font-weight:700;">${escapeHtml(resumeJson.name || "")}</div>
-    <div style="font-size:${smallPt}pt; color:#333; margin-top:2px;">${contactLine}</div>
-  </div>`;
+    .join("   |   ");
+  if (contactLine) {
+    doc.setFont("Helvetica", "normal");
+    doc.setFontSize(smallPt);
+    doc.text(contactLine, PDF_PAGE_WIDTH_PT / 2, cursorY, { align: "center" });
+    cursorY += smallPt * 1.3;
+  }
 
   if (resumeJson.summary) {
-    html += resumeSectionHeadingHtml("Summary", fontSizePt);
-    html += `<div style="margin-bottom:6px;">${escapeHtml(resumeJson.summary)}</div>`;
+    addSectionHeading("Summary");
+    addWrappedText(resumeJson.summary, fontSizePt);
   }
 
   if (Array.isArray(resumeJson.skills) && resumeJson.skills.length) {
-    html += resumeSectionHeadingHtml("Skills", fontSizePt);
-    html += `<div style="margin-bottom:6px;">${escapeHtml(resumeJson.skills.join(", "))}</div>`;
+    addSectionHeading("Skills");
+    addWrappedText(resumeJson.skills.join(", "), fontSizePt);
   }
 
   if (Array.isArray(resumeJson.experience) && resumeJson.experience.length) {
-    html += resumeSectionHeadingHtml("Experience", fontSizePt);
+    addSectionHeading("Experience");
     resumeJson.experience.forEach((entry) => {
-      const titleLine = [entry.title, entry.org].filter(Boolean).map(escapeHtml).join(", ");
-      html += `<div style="margin-bottom:8px;">
-        <div style="display:flex; justify-content:space-between;">
-          <span style="font-weight:700;">${titleLine}</span>
-          <span>${escapeHtml(entry.dates || "")}</span>
-        </div>
-        ${entry.location ? `<div style="font-style:italic; font-size:${smallPt}pt;">${escapeHtml(entry.location)}</div>` : ""}
-        <ul style="margin:4px 0 0 18px; padding:0;">
-          ${(entry.bullets || []).map((b) => `<li style="margin-bottom:2px;">${escapeHtml(b)}</li>`).join("")}
-        </ul>
-      </div>`;
+      const titleLine = [entry.title, entry.org].filter(Boolean).join(", ");
+      addEntryHeadingRow(titleLine, entry.dates || "", fontSizePt);
+      if (entry.location) {
+        doc.setFont("Helvetica", "italic");
+        doc.setFontSize(smallPt);
+        doc.text(entry.location, PDF_MARGIN_PT, cursorY);
+        cursorY += smallPt * 1.3;
+      }
+      addBullets(entry.bullets, fontSizePt);
+      cursorY += 4;
     });
   }
 
   if (Array.isArray(resumeJson.projects) && resumeJson.projects.length) {
-    html += resumeSectionHeadingHtml("Projects", fontSizePt);
+    addSectionHeading("Projects");
     resumeJson.projects.forEach((entry) => {
-      html += `<div style="margin-bottom:8px;">
-        <div style="display:flex; justify-content:space-between;">
-          <span style="font-weight:700;">${escapeHtml(entry.name || "")}</span>
-          <span>${escapeHtml(entry.dates || "")}</span>
-        </div>
-        <ul style="margin:4px 0 0 18px; padding:0;">
-          ${(entry.bullets || []).map((b) => `<li style="margin-bottom:2px;">${escapeHtml(b)}</li>`).join("")}
-        </ul>
-      </div>`;
+      addEntryHeadingRow(entry.name || "", entry.dates || "", fontSizePt);
+      addBullets(entry.bullets, fontSizePt);
+      cursorY += 4;
     });
   }
 
   const edu = resumeJson.education;
   if (edu && (edu.school || edu.degree)) {
-    html += resumeSectionHeadingHtml("Education", fontSizePt);
-    const eduLine = [edu.school, edu.degree].filter(Boolean).map(escapeHtml).join(", ");
-    html += `<div style="display:flex; justify-content:space-between;">
-      <span style="font-weight:700;">${eduLine}</span>
-      <span>${escapeHtml(edu.dates || "")}</span>
-    </div>`;
+    addSectionHeading("Education");
+    const eduLine = [edu.school, edu.degree].filter(Boolean).join(", ");
+    addEntryHeadingRow(eduLine, edu.dates || "", fontSizePt);
     if (edu.details) {
-      html += `<div>${escapeHtml(edu.details)}</div>`;
+      addWrappedText(edu.details, fontSizePt);
     }
   }
 
-  html += `</div>`;
-  return html;
-}
-
-function createResumePageElement(resumeJson, fontSizePt) {
-  const div = document.createElement("div");
-  // Off-screen but still laid out (not display:none) so scrollHeight reflects
-  // real rendered height for the overflow check below.
-  div.style.position = "fixed";
-  div.style.left = "-99999px";
-  div.style.top = "0";
-  div.style.width = `${RESUME_PAGE_WIDTH_PX}px`;
-  div.style.boxSizing = "border-box";
-  div.style.padding = `${RESUME_MARGIN_PX}px`;
-  div.style.background = "#ffffff";
-  div.innerHTML = buildResumeHtml(resumeJson, fontSizePt);
-  return div;
+  return { doc, overflowed: cursorY > PDF_BOTTOM_Y_PT };
 }
 
 // One-page enforcement order: LLM compression pass first (preserves content,
 // just tightens wording), only reduce font-size as a last resort, floor at
 // 10pt. Never drops content on its own — if still overflowing at the floor,
 // this returns fits:false and the caller proceeds anyway (best effort; there
-// is no further lever that doesn't mean fabricating a shorter resume).
+// is no further lever that doesn't mean fabricating a shorter resume — any
+// remaining overflow just extends past the bottom margin in the saved PDF).
 async function fitResumeToOnePage(resumeJson, statusCallback) {
   let currentJson = resumeJson;
   let fontSizePt = 11;
 
-  let pageEl = createResumePageElement(currentJson, fontSizePt);
-  document.body.appendChild(pageEl);
-  let height = pageEl.scrollHeight;
+  let { doc, overflowed } = drawResumePdf(currentJson, fontSizePt);
 
-  if (height > RESUME_PAGE_HEIGHT_PX) {
-    pageEl.remove();
+  if (overflowed) {
     if (statusCallback) statusCallback("Tightening bullets to fit one page...");
     const compressResponse = await requestCompressResume({ resumeJson: currentJson });
     if (compressResponse && compressResponse.success) {
       currentJson = compressResponse.resumeJson;
     }
-    pageEl = createResumePageElement(currentJson, fontSizePt);
-    document.body.appendChild(pageEl);
-    height = pageEl.scrollHeight;
+    ({ doc, overflowed } = drawResumePdf(currentJson, fontSizePt));
   }
 
-  while (height > RESUME_PAGE_HEIGHT_PX && fontSizePt > RESUME_FONT_FLOOR_PT) {
-    pageEl.remove();
+  while (overflowed && fontSizePt > RESUME_FONT_FLOOR_PT) {
     fontSizePt -= 0.5;
-    pageEl = createResumePageElement(currentJson, fontSizePt);
-    document.body.appendChild(pageEl);
-    height = pageEl.scrollHeight;
+    ({ doc, overflowed } = drawResumePdf(currentJson, fontSizePt));
   }
 
-  return { resumeJson: currentJson, pageEl, fits: height <= RESUME_PAGE_HEIGHT_PX };
+  return { doc, resumeJson: currentJson, fits: !overflowed };
 }
 
 // Simple suffix on the source filename's own extension — full naming-pattern
-// inference (step 5) is a separate, later step.
+// inference (step 5) is a separate, later step. Confirmed correct from
+// testing — kept exactly as-is.
 function buildTailoredFilename(sourceFilename) {
   if (!sourceFilename) return "Tailored_Resume.pdf";
   const dotIndex = sourceFilename.lastIndexOf(".");
@@ -752,20 +785,9 @@ function buildTailoredFilename(sourceFilename) {
 }
 
 async function downloadTailoredResumePdf(resumeJson, statusCallback) {
-  const { pageEl } = await fitResumeToOnePage(resumeJson, statusCallback);
-  const filename = buildTailoredFilename(resumeJson.sourceFilename);
-
-  try {
-    await window.html2pdf().set({
-      margin: 0, // margin is already baked into pageEl's padding
-      filename,
-      jsPDF: { unit: "px", format: [RESUME_PAGE_WIDTH_PX, RESUME_PAGE_HEIGHT_PX], orientation: "portrait" },
-      html2canvas: { scale: 2, windowWidth: RESUME_PAGE_WIDTH_PX }
-    }).from(pageEl).save();
-  } finally {
-    pageEl.remove();
-  }
-
+  const { doc, resumeJson: finalJson } = await fitResumeToOnePage(resumeJson, statusCallback);
+  const filename = buildTailoredFilename(finalJson.sourceFilename);
+  doc.save(filename);
   return filename;
 }
 

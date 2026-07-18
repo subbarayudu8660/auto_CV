@@ -295,60 +295,88 @@ Build order (per session plan, do not reorder):
   ("tighten by ~15%, never drop a bullet/entry/skill, no new claims") since
   by this point the resume is already tailored and just needs to get
   shorter, not rewritten again.
-- **One-page enforcement, in `content.js`** (`fitResumeToOnePage`): builds an
-  off-screen (`position:fixed; left:-99999px`, not `display:none`, so
-  `scrollHeight` is real) page element at exactly `816x1056px` (8.5x11in @
-  96dpi) with `RESUME_MARGIN_PX = 48` (0.5in) baked into its own padding —
-  the same box that's measured is the same box that's rendered, no separate
-  margin math to keep in sync. Order matches the spec exactly: if
-  `scrollHeight > 1056`, first request one `COMPRESS_RESUME` pass and
-  re-measure; only if *still* overflowing after that does it start
-  decrementing `fontSizePt` by 0.5 in a loop, floored at
-  `RESUME_FONT_FLOOR_PT = 10`. If it's still over the floor at 10pt, the
-  function returns `fits:false` and the caller proceeds anyway — there's no
-  further lever that doesn't mean fabricating a shorter resume, which is
-  out of scope for this pass. Not yet surfaced to the user when this happens
-  (see open items below).
-- **HTML template** (`buildResumeHtml`): plain single-column ATS-safe layout
-  — Arial/Helvetica, no tables/icons/multi-column, section order name+contact
-  header → summary → skills → experience → projects → education (matches
-  the spec's requested order). **This is a placeholder layout, not a real
-  visual spec** — built this way because there was nothing to match against
-  yet. **Will need to be revisited once a real visual spec is provided** (see
-  open items below) — likely a significant rewrite of `buildResumeHtml`,
-  not just a tweak, since matching an exact existing resume's fonts/spacing/
-  section styling is a different task than "generic ATS-safe."
-- **PDF render/download**: `html2pdf.js` bundled locally as
-  `html2pdf.bundle.min.js` (npm `html2pdf.js@0.14.0`, the UMD bundle build —
-  confirmed it sets `window.html2pdf`, same non-module classic-script
-  pattern as `jspdf.umd.min.js`), added to `manifest.json`'s
-  `content_scripts.js` array before `content.js`. Deliberately kept fully
-  separate from the cover letter's jsPDF path — `buildAndDownloadPdf()` (cover
-  letter) and `downloadTailoredResumePdf()` (resume tailoring) don't share
-  any code, matching the instruction not to cross-wire them. `jsPDF`'s
-  `unit: "px"` with `format: [816, 1056]` is passed straight through
-  html2pdf's own vendored jsPDF so the physical PDF page matches the
-  816x1056px measurement box exactly.
-- **Filename** (step 5, minimal version only): `buildTailoredFilename()` is
-  a simple suffix — inserts `_Tailored` before the source filename's
-  extension (or appends `_Tailored.pdf` if there's no extension, or falls
-  back to a static `Tailored_Resume.pdf` if `sourceFilename` is empty). This
-  is deliberately not the full naming-pattern-inference step described in
-  the original spec (parsing where a role/variant tag sits in the filename,
-  etc.) — that's saved for a dedicated future pass since it's "cosmetic and
-  easiest to get wrong in a way that doesn't matter functionally," per the
-  original build-order rationale.
-- **Not yet live-tested** — pending, in rough priority order: (1) a
-  before/after JSON diff on a real resume to confirm `TAILOR_RESUME` never
-  adds a new experience/project entry — the single most safety-critical
-  check in this whole feature; (2) a real JD/resume pair that actually
-  triggers PDF overflow, to confirm the compress-then-shrink-font sequence
-  fires in the right order and produces a real one-page PDF; (3) the "still
-  overflowing even at the 10pt floor" case, which currently has no explicit
-  user-facing message (the PDF just downloads as-is); (4) the generic HTML
-  layout's actual visual output once opened as a PDF (font sizes read as
-  pt correctly, bullets/sections don't clip oddly, `html2canvas`'s `scale: 2`
-  doesn't blur small text).
+- **PDF render — tried html2pdf.js, reverted due to a structural CSP
+  conflict (do not reintroduce it):** the original implementation bundled
+  `html2pdf.js` locally and rendered by cloning the resume's HTML into a
+  hidden iframe (via `html2canvas`) and screenshotting it to canvas. On a
+  real Handshake page this failed every time: `html2canvas` clones the
+  **entire host document**, including Handshake's own `<script>` tags, into
+  that hidden iframe so it can compute layout/styles — and loading those
+  scripts inside the clone violates *Handshake's own CSP*. The console
+  showed repeated `Loading the script '...joinhandshake.com/dist/consumer/
+  *.js' violates ... Content Security Policy` errors from
+  `html2pdf.bundle.min.js:2 (e.toIFrame)`, the clone/render silently failed,
+  and the result was a perfectly-named, correctly-sized, **blank** PDF. This
+  is a structural incompatibility with any CSP-restrictive host page, not a
+  config bug or something fixable with different html2pdf options —
+  `html2pdf.bundle.min.js` has been deleted, removed from
+  `manifest.json`'s `content_scripts.js`, and is no longer a dependency of
+  this feature. **Don't reintroduce a DOM-screenshot renderer for this
+  feature.**
+- **Current implementation: direct jsPDF vector rendering, no DOM/canvas
+  involved.** `drawResumePdf(resumeJson, fontSizePt)` in `content.js` draws
+  straight into a `new jsPDF({ unit: "pt", format: "letter" })` instance
+  using `doc.text()`/`doc.setFont()`/`doc.line()`/`doc.splitTextToSize()` —
+  the same jsPDF library already bundled for the cover letter
+  (`jspdf.umd.min.js`), but a **separate `jsPDF` instance** so the two paths
+  stay fully decoupled (`buildAndDownloadPdf()` for the cover letter,
+  `downloadTailoredResumePdf()` for resume tailoring — no shared code).
+  Sidesteps the CSP problem entirely since there's no DOM clone, no hidden
+  iframe, no script loading of any kind — and as a side benefit produces
+  sharp vector text instead of a rasterized image, which is actually better
+  for ATS parsing (ties back to the "single-column, standard font,
+  ATS-safe" requirement). Page geometry is in points (`PDF_PAGE_WIDTH_PT =
+  612`, `PDF_PAGE_HEIGHT_PT = 792`, `PDF_MARGIN_PT = 36`, all 8.5x11in @
+  72pt/in) so page math and font-size math share one unit with no px↔pt
+  conversion to keep in sync.
+- **One-page enforcement, adapted to jsPDF** (`fitResumeToOnePage`): since
+  there's no rendered DOM element to measure `scrollHeight` against anymore,
+  overflow is tracked via **cursor-position bookkeeping** instead —
+  `drawResumePdf()` accumulates a `cursorY` as it writes each line/section
+  and returns `overflowed: cursorY > PDF_BOTTOM_Y_PT` once the whole resume
+  has been drawn. The enforcement order is otherwise unchanged from the
+  original spec: if overflowed, first request one `COMPRESS_RESUME` pass and
+  redraw/re-check; only if *still* overflowing does it start decrementing
+  `fontSizePt` by 0.5 in a loop, floored at `RESUME_FONT_FLOOR_PT = 10`. If
+  still over the floor at 10pt, the function returns `fits:false` and the
+  caller saves the PDF anyway (best effort — any remaining overflow just
+  extends past the bottom margin in the saved file; not yet surfaced to the
+  user as an explicit warning, see open items below).
+- **HTML→now-PDF template** (`drawResumePdf`'s internal `addWrappedText`/
+  `addBullets`/`addSectionHeading`/`addEntryHeadingRow` helpers): plain
+  single-column ATS-safe layout — Helvetica, no tables/icons/multi-column,
+  section order name+contact header → summary → skills → experience →
+  projects → education (matches the spec's requested order). **This is
+  still a placeholder layout, not a real visual spec** — same caveat as
+  before the html2pdf revert, just implemented with jsPDF draw calls now
+  instead of HTML/CSS strings. **Will need to be revisited once a real
+  visual spec is provided** (see open items below) — likely a rewrite of
+  these draw helpers, not just a tweak, since matching an exact existing
+  resume's fonts/spacing/section styling is a different task than "generic
+  ATS-safe."
+- **Filename** (step 5, minimal version only, unchanged by the CSP fix):
+  `buildTailoredFilename()` is a simple suffix — inserts `_Tailored` before
+  the source filename's extension (or appends `_Tailored.pdf` if there's no
+  extension, or falls back to a static `Tailored_Resume.pdf` if
+  `sourceFilename` is empty). Confirmed correct from testing, kept exactly
+  as-is through this rewrite. Deliberately not the full naming-pattern-
+  inference step described in the original spec — that's saved for a
+  dedicated future pass since it's "cosmetic and easiest to get wrong in a
+  way that doesn't matter functionally," per the original build-order
+  rationale.
+- **Live-test status**: the CSP/blank-PDF bug was caught by live-testing on
+  a real Handshake posting — that's how this was found, not guessed. The
+  jsPDF vector rewrite itself is not yet live-tested. Pending, in rough
+  priority order: (1) a before/after JSON diff on a real resume to confirm
+  `TAILOR_RESUME` never adds a new experience/project entry — the single
+  most safety-critical check in this whole feature, still open from before
+  the CSP bug; (2) confirm the new renderer actually produces a non-blank,
+  correctly laid-out one-page PDF on a real Handshake posting (the thing
+  that just broke); (3) a real JD/resume pair that actually triggers
+  overflow, to confirm the compress-then-shrink-font sequence still fires
+  correctly against cursor-position tracking instead of DOM height; (4) the
+  "still overflowing even at the 10pt floor" case, which still has no
+  explicit user-facing message.
 
 ### Design decisions carried through from planning into steps 3-4 (now implemented — see that section above for the actual code)
 
@@ -362,9 +390,10 @@ Build order (per session plan, do not reorder):
 - **No new experience/project entries, ever** — implemented as
   `TAILOR_RESUME_SYSTEM_PROMPT`'s single hard rule, stated with bad/good
   example pairs, same structural approach as the `<letter>` rule.
-- `html2pdf.js` bundled locally, resume-tailoring PDF only;
-  `jspdf.umd.min.js` stays dedicated to the cover letter path — implemented,
-  not cross-wired.
+- `html2pdf.js` bundled locally, resume-tailoring PDF only — **tried, then
+  reverted** (see Steps 3+4 above for the CSP root cause); the
+  resume-tailoring PDF now uses its own separate `jsPDF` instance instead,
+  still kept fully decoupled from the cover letter's jsPDF usage as planned.
 - One-page enforcement order — LLM compression pass first, font-size
   reduction only as a last resort, floor at 10pt — implemented exactly as
   planned in `fitResumeToOnePage()`.
@@ -378,11 +407,17 @@ Build order (per session plan, do not reorder):
   `content.js` in content_scripts so `window.jspdf` is available. Dedicated
   to the cover letter PDF path — `buildAndDownloadPdf()` — never touched by
   the resume tailoring feature.
-- `html2pdf.bundle.min.js` — html2pdf.js bundled locally (npm
-  `html2pdf.js@0.14.0`, UMD bundle build, not CDN-loaded), loaded before
-  `content.js` in content_scripts so `window.html2pdf` is available.
-  Dedicated to the resume tailoring PDF path — `downloadTailoredResumePdf()`
-  — kept fully separate from the cover letter's jsPDF path.
+- ~~`html2pdf.bundle.min.js`~~ — **removed.** Was bundled locally (npm
+  `html2pdf.js@0.14.0`) for the resume tailoring PDF path, but its
+  html2canvas-based rendering clones the entire host document into a hidden
+  iframe, which trips Handshake's own CSP against loading its `<script>`
+  tags in that clone — silent render failure, blank PDF. Deleted from disk
+  and removed from `manifest.json`'s `content_scripts.js`. The resume
+  tailoring PDF (`downloadTailoredResumePdf()` in `content.js`) now draws
+  directly with a separate `jsPDF` instance instead (vector text, no DOM/
+  canvas/iframe involved) — see "Steps 3+4" in the Resume Tailoring section
+  below for the full writeup. **Do not reintroduce html2pdf.js or any other
+  DOM-screenshot renderer for this feature.**
 - `pdfjs/pdf.min.mjs` / `pdfjs/pdf.worker.min.mjs` — pdf.js bundled locally
   (`pdfjs-dist@6.1.200`, ESM build, not CDN-loaded), dynamically imported
   from `popup.js` to extract text from an uploaded resume PDF client-side
