@@ -203,6 +203,9 @@
   }
   .import-error {
     font-size: 11px;
+    color: var(--text-muted);
+  }
+  .import-error.is-error {
     color: #a33;
   }
 </style>
@@ -249,6 +252,23 @@
 
     <h1 style="margin-top: 24px;">Resume Tailoring</h1>
     <p class="subtitle">Separate structured resume used only by the tailoring feature — not the plain-text resume above.</p>
+
+    <div class="card">
+      <h2>Auto-extract from resume</h2>
+      <p class="help">Upload your resume PDF or paste its text below, then click Extract. Claude structures it into the fields below for you to review and correct before saving — it does not rewrite or improve the wording, just extracts it faithfully.</p>
+      <div class="field">
+        <label for="rjResumeFile">Resume PDF</label>
+        <input type="file" id="rjResumeFile" accept="application/pdf" />
+      </div>
+      <div class="field">
+        <label for="rjResumePasteText">Or paste resume text instead</label>
+        <textarea id="rjResumePasteText" class="resume" placeholder="Paste your resume text here instead of uploading a PDF..."></textarea>
+      </div>
+      <div class="import-row">
+        <button type="button" class="import-btn" id="rjExtractBtn">Extract</button>
+        <span class="import-error" id="rjExtractStatus"></span>
+      </div>
+    </div>
 
     <div class="card">
       <h2>Basics</h2>

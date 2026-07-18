@@ -61,6 +61,10 @@ const rjSavedMsg = document.getElementById("rjSavedMsg");
 const rjImportJsonEl = document.getElementById("rjImportJson");
 const rjImportBtn = document.getElementById("rjImportBtn");
 const rjImportErrorEl = document.getElementById("rjImportError");
+const rjResumeFileEl = document.getElementById("rjResumeFile");
+const rjResumePasteTextEl = document.getElementById("rjResumePasteText");
+const rjExtractBtn = document.getElementById("rjExtractBtn");
+const rjExtractStatusEl = document.getElementById("rjExtractStatus");
 
 function emptyResumeJson() {
   return {
@@ -232,19 +236,91 @@ rjSaveBtn.addEventListener("click", () => {
 
 rjImportBtn.addEventListener("click", () => {
   rjImportErrorEl.textContent = "";
+  rjImportErrorEl.classList.remove("is-error");
   let parsed;
   try {
     parsed = JSON.parse(rjImportJsonEl.value);
   } catch (err) {
     rjImportErrorEl.textContent = "Invalid JSON: " + err.message;
+    rjImportErrorEl.classList.add("is-error");
     return;
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     rjImportErrorEl.textContent = "Expected a JSON object matching the resumeJson schema.";
+    rjImportErrorEl.classList.add("is-error");
     return;
   }
   applyResumeJsonToForm(parsed);
   rjImportJsonEl.value = "";
+});
+
+// --- Auto-extraction (Call 0): PDF upload or paste -> Claude structures it -> review/correct in the form above ---
+
+async function extractPdfText(file) {
+  const pdfjsLib = await import(chrome.runtime.getURL("pdfjs/pdf.min.mjs"));
+  pdfjsLib.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("pdfjs/pdf.worker.min.mjs");
+
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+  let text = "";
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    text += content.items.map((item) => item.str).join(" ") + "\n\n";
+  }
+  return text.trim();
+}
+
+function setExtractStatus(message, isError) {
+  rjExtractStatusEl.textContent = message;
+  rjExtractStatusEl.classList.toggle("is-error", !!isError);
+}
+
+rjExtractBtn.addEventListener("click", async () => {
+  const file = rjResumeFileEl.files[0];
+  const pasteText = rjResumePasteTextEl.value.trim();
+
+  if (!file && !pasteText) {
+    setExtractStatus("Upload a PDF or paste resume text first.", true);
+    return;
+  }
+
+  rjExtractBtn.disabled = true;
+
+  try {
+    let resumeText = pasteText;
+    let inferredFilename = "";
+
+    if (file) {
+      setExtractStatus("Reading PDF...", false);
+      resumeText = await extractPdfText(file);
+      inferredFilename = file.name;
+      if (!resumeText) {
+        setExtractStatus("Could not extract text from that PDF — try pasting the resume text instead.", true);
+        return;
+      }
+    }
+
+    setExtractStatus("Asking Claude to structure it...", false);
+    const response = await chrome.runtime.sendMessage({ type: "EXTRACT_RESUME", resumeText });
+
+    if (!response?.success) {
+      setExtractStatus(response?.error || "Extraction failed.", true);
+      return;
+    }
+
+    const resumeJson = response.resumeJson;
+    if (inferredFilename && !resumeJson.sourceFilename) {
+      resumeJson.sourceFilename = inferredFilename;
+    }
+    applyResumeJsonToForm(resumeJson);
+    setExtractStatus("Extracted — review the fields below, then Save.", false);
+  } catch (err) {
+    setExtractStatus("Unexpected error: " + err.message, true);
+  } finally {
+    rjExtractBtn.disabled = false;
+  }
 });
 
 loadResumeJson();

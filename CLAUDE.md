@@ -18,11 +18,16 @@ missing JD-relevant skills for the user to approve, then an LLM rewrite pass
 that only edits existing bullets/skills (never adds new experience/project
 entries), rendered to a one-page PDF matching the current resume's layout.
 
-**Status: step 1 of 5 done, live-tested pending user review. Steps 2-5 not
-started.**
+**Status: step 1 done + an added auto-extraction step ("Call 0") done, both
+built and pending user review/live-testing. Steps 2-5 (skill-analysis
+checklist onward) not started.**
 
 Build order (per session plan, do not reorder):
 1. ✅ `resumeJson` storage schema + popup UI to input/edit it.
+1b. ✅ (added mid-session, not in the original 5-step plan) Auto-extraction
+    ("Call 0"): upload a resume PDF or paste text, Claude structures it into
+    `resumeJson`, user reviews/corrects in the same form from step 1 before
+    saving — replaces typing the form out from scratch. See below.
 2. ⬜ `ANALYZE_RESUME_SKILLS` call + checklist panel state, tested against a
    real JD.
 3. ⬜ `TAILOR_RESUME` call with hard constraints, verified (before/after JSON
@@ -30,6 +35,59 @@ Build order (per session plan, do not reorder):
 4. ⬜ HTML render + one-page enforcement + PDF download (generic layout
    first, real visual spec to follow later).
 5. ⬜ Filename inference from `sourceFilename`'s naming pattern.
+
+### Step 1b — auto-extraction ("Call 0") (done, not yet live-tested)
+
+- New top card in the Resume Tailoring section, above Basics: "Auto-extract
+  from resume" — a `.pdf` file input plus a paste-text `<textarea>` fallback,
+  and an Extract button (`rjExtractBtn`/`rjExtractStatus`).
+- **PDF text extraction happens client-side in the popup**, not sent to the
+  backend as a binary: `extractPdfText()` in `popup.js` dynamically imports
+  bundled `pdfjs/pdf.min.mjs` (`import(chrome.runtime.getURL(...))`,  works
+  as a dynamic `import()` expression even though `popup.js` itself is a
+  classic, non-module script) and walks every page's `getTextContent()`,
+  joining item strings with spaces and pages with blank lines. Only plain
+  text extraction is used (no canvas/rendering), so no canvas polyfill was
+  needed.
+- **pdf.js is bundled locally** under `pdfjs/pdf.min.mjs` +
+  `pdfjs/pdf.worker.min.mjs` (npm `pdfjs-dist@6.1.200`, the `build/` ESM
+  output — this version only ships `.mjs`, no classic UMD build, which is
+  fine since Chrome extension pages support `<script type="module">` /
+  dynamic `import()` natively) — same "no remote code" rule as
+  `jspdf.umd.min.js`. `pdfjsLib.GlobalWorkerOptions.workerSrc` is pointed at
+  `chrome.runtime.getURL("pdfjs/pdf.worker.min.mjs")`; no
+  `web_accessible_resources` entry was needed in `manifest.json` because the
+  popup is an extension page loading an extension-local resource, not a web
+  page reaching into the extension.
+- New `EXTRACT_RESUME` message in `background.js`: sends the raw resume text
+  (from either the PDF or the paste box) to Claude (`claude-sonnet-4-6`, no
+  web search tool — this call doesn't need it) with a system prompt whose
+  single hard rule is **extraction only, never rewrite/improve/embellish
+  wording** — enforced with a bad-example/good-example pair, same structural
+  approach as the cover letter's `<letter>`-tag rule and the planned "never
+  invent an experience entry" rule for step 3. Output is wrapped in
+  `<resume_json>...</resume_json>`, parsed with the same
+  tag-match-else-fall-back-to-full-text pattern as `<letter>`, then
+  `JSON.parse`'d **inside the service worker** before being returned to the
+  popup — a JSON parse failure returns a clear user-facing error
+  ("try again, or paste text instead of uploading the PDF") rather than
+  corrupting the form with garbage.
+- The result is **not auto-saved** — `applyResumeJsonToForm()` (the same
+  function the JSON-import escape hatch uses) populates the step-1 form
+  fields so the user can review/correct before clicking the existing
+  "Save structured resume" button. This is deliberate: multi-column/tabular
+  source PDFs are the likely failure point (text extracted from PDF.js loses
+  column structure and can interleave lines from side-by-side columns), so
+  the extraction step is explicitly a draft, not a direct write to storage.
+- `sourceFilename` is auto-filled from the uploaded file's actual filename
+  only if Claude's extraction left it blank and a file (not paste) was used;
+  otherwise the manual `rjSourceFilename` field from step 1 still applies.
+- No `manifest.json` changes were needed: no new permissions, no new
+  `host_permissions` (reuses the existing `api.anthropic.com` entry), no
+  `web_accessible_resources`.
+- **Not yet live-tested** — pending user review of: a real single-column PDF,
+  a real multi-column/tabular PDF (expected weak point), the paste-only
+  path, and the empty-API-key / empty-resume-text error messages.
 
 ### Step 1 — `resumeJson` schema + popup UI (done)
 
@@ -101,7 +159,15 @@ Build order (per session plan, do not reorder):
   scripting. Host permissions: `*.joinhandshake.com`, `api.anthropic.com`,
   `api.github.com`.
 - `jspdf.umd.min.js` — jsPDF bundled locally (not CDN-loaded), loaded before
-  `content.js` in content_scripts so `window.jspdf` is available.
+  `content.js` in content_scripts so `window.jspdf` is available. Dedicated
+  to the cover letter PDF path — the resume tailoring feature's PDF output
+  (step 4, not yet built) will use `html2pdf.js` instead, kept separate per
+  the plan in the Resume Tailoring section below.
+- `pdfjs/pdf.min.mjs` / `pdfjs/pdf.worker.min.mjs` — pdf.js bundled locally
+  (`pdfjs-dist@6.1.200`, ESM build, not CDN-loaded), dynamically imported
+  from `popup.js` to extract text from an uploaded resume PDF client-side
+  before sending the plain text to `background.js` for structuring. See
+  "Step 1b — auto-extraction" below.
 - `background.js` — service worker. Handles `GENERATE_COVER_LETTER`
   messages:
   - If a GitHub username is stored, `fetchGithubReposBlock()` fetches the

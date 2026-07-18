@@ -157,9 +157,130 @@ Write the cover letter body now, following the system instructions exactly.`;
   return { success: true, letterText, companyName, jobTitle };
 }
 
+const EXTRACT_RESUME_SYSTEM_PROMPT = `You are extracting structured data from a real person's resume. This is EXTRACTION ONLY, not writing or editing.
+
+CRITICAL RULE: Do not rewrite, rephrase, improve, embellish, or summarize any wording. Copy each bullet, title, and summary sentence exactly as it appears in the source text (fixing only obvious OCR/whitespace artifacts like a stray line break mid-sentence). If a field is not present in the source text, leave it as an empty string or empty array — never invent a value.
+
+Bad (rewriting instead of extracting):
+Source bullet: "Built a dashboard in Tableau for the sales team"
+Bad output: "Engineered a comprehensive Tableau analytics dashboard, driving actionable insights for sales stakeholders"
+
+Good (faithful extraction):
+Source bullet: "Built a dashboard in Tableau for the sales team"
+Good output: "Built a dashboard in Tableau for the sales team"
+
+Structure the resume into exactly this JSON schema:
+{
+  "name": "",
+  "contact": { "email": "", "phone": "", "location": "", "linkedin": "", "github": "", "portfolio": "" },
+  "summary": "",
+  "skills": ["..."],
+  "experience": [{ "title": "", "org": "", "location": "", "dates": "", "bullets": ["..."] }],
+  "projects": [{ "name": "", "dates": "", "bullets": ["..."] }],
+  "education": { "school": "", "degree": "", "dates": "", "details": "" }
+}
+
+Notes:
+- "skills" is a flat array of individual skill strings, split out of however the source lists them (comma-separated line, bulleted list, categorized groups — flatten all of it into one array).
+- "experience" is paid/professional roles; "projects" is standalone projects (personal, academic, or listed in a dedicated Projects section) — use the source resume's own section boundaries to decide which is which, don't guess based on content alone.
+- "education.details" is for GPA/honors/coursework if present, else leave it an empty string.
+- If the source resume has a table layout, multiple columns, or any structure that's ambiguous to parse (this is common with text extracted from a multi-column PDF, where lines from different columns can get interleaved), do your best faithful extraction and do not fabricate content to fill gaps.
+
+CRITICAL OUTPUT FORMAT: You may reason about the resume's structure first if needed. But the final JSON must be wrapped in <resume_json></resume_json> tags with absolutely nothing else inside those tags except the raw JSON object: no markdown code fences, no commentary. Everything outside the tags is discarded and never shown to anyone, so use that space for any reasoning, but the content inside <resume_json></resume_json> must be valid JSON matching the schema above exactly.`;
+
+async function extractResume({ resumeText }) {
+  const stored = await chrome.storage.local.get(["apiKey"]);
+  const { apiKey } = stored;
+
+  if (!apiKey) {
+    return { success: false, error: "No Anthropic API key saved. Open the extension popup and add your API key in settings." };
+  }
+  if (!resumeText || !resumeText.trim()) {
+    return { success: false, error: "No resume text to extract from." };
+  }
+
+  const userMessage = `<resume_text>
+${resumeText}
+</resume_text>
+
+Extract this resume into the JSON schema now, following the system instructions exactly.`;
+
+  let response;
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true"
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 4000,
+        system: EXTRACT_RESUME_SYSTEM_PROMPT,
+        messages: [{ role: "user", content: userMessage }]
+      })
+    });
+  } catch (networkErr) {
+    return { success: false, error: "Network error reaching the Anthropic API. Check your internet connection and try again." };
+  }
+
+  if (!response.ok) {
+    if (response.status === 401) {
+      return { success: false, error: "Anthropic API key was rejected (401). Double-check the key saved in the popup settings." };
+    }
+    if (response.status === 429) {
+      return { success: false, error: "Rate limited by the Anthropic API (429). Wait a moment and try again." };
+    }
+    let bodyText = "";
+    try {
+      const errJson = await response.json();
+      bodyText = errJson?.error?.message || "";
+    } catch (_) {}
+    return { success: false, error: `Anthropic API request failed (${response.status}). ${bodyText}`.trim() };
+  }
+
+  let data;
+  try {
+    data = await response.json();
+  } catch (parseErr) {
+    return { success: false, error: "Could not parse the response from the Anthropic API." };
+  }
+
+  const content = Array.isArray(data.content) ? data.content : [];
+  const fullText = content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n")
+    .trim();
+
+  const match = fullText.match(/<resume_json>([\s\S]*?)<\/resume_json>/);
+  const jsonText = match ? match[1].trim() : fullText.trim();
+
+  if (!jsonText) {
+    return { success: false, error: "Claude returned an empty response. This can happen if the request was declined — try again." };
+  }
+
+  let resumeJson;
+  try {
+    resumeJson = JSON.parse(jsonText);
+  } catch (parseErr) {
+    return { success: false, error: "Claude's response wasn't valid JSON, so it couldn't be parsed into the resume form. Try again, or paste the resume text manually instead of uploading the PDF." };
+  }
+
+  return { success: true, resumeJson };
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "GENERATE_COVER_LETTER") {
     generateCoverLetter(message)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: `Unexpected error: ${err.message}` }));
+    return true;
+  }
+  if (message?.type === "EXTRACT_RESUME") {
+    extractResume(message)
       .then(sendResponse)
       .catch((err) => sendResponse({ success: false, error: `Unexpected error: ${err.message}` }));
     return true;
