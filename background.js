@@ -21,18 +21,46 @@ Rules for the body — this is the part most AI-generated letters get wrong:
 
 Format: 3-4 short paragraphs, 250-300 words total. No greeting or signature block, just the body. Output nothing except the letter itself.`;
 
+// Plain-completion API calls (no web search) get this ceiling. A stalled
+// connection (server accepts the socket but never responds, never fires an
+// error event) otherwise hangs the underlying fetch() forever — there is no
+// default timeout, confirmed by reproducing against a server that accepts
+// but never answers.
+const API_TIMEOUT_MS = 45000;
+// The cover letter call has the web_search tool enabled, which can genuinely
+// take longer than a plain completion (searching + reading results before
+// writing) — ceiling set above the typical 30-45s window so a legitimately
+// slow-but-successful search isn't mistaken for a hang.
+const WEB_SEARCH_TIMEOUT_MS = 55000;
+// GitHub context is optional and this lookup should be fast — short ceiling
+// so a stalled GitHub API call can't block the entire letter generation flow
+// (it's awaited before the Claude call even starts).
+const GITHUB_FETCH_TIMEOUT_MS = 10000;
+
 async function fetchGithubReposBlock(githubUsername) {
   if (!githubUsername) return "";
 
   let repos;
   try {
-    const res = await fetch(
-      `https://api.github.com/users/${encodeURIComponent(githubUsername)}/repos?sort=updated&per_page=15&type=owner`
-    );
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), GITHUB_FETCH_TIMEOUT_MS);
+    let res;
+    try {
+      res = await fetch(
+        `https://api.github.com/users/${encodeURIComponent(githubUsername)}/repos?sort=updated&per_page=15&type=owner`,
+        { signal: controller.signal }
+      );
+    } finally {
+      clearTimeout(timeoutId);
+    }
     if (!res.ok) return "";
     repos = await res.json();
     if (!Array.isArray(repos)) return "";
   } catch (_) {
+    // Covers network failures, rate limiting, and a stalled connection that
+    // timed out via the AbortController above — all treated the same way,
+    // since GitHub context is optional and never worth blocking letter
+    // generation over.
     return "";
   }
 
@@ -97,6 +125,8 @@ ${githubReposBlock || "None provided."}
 Write the cover letter body now, following the system instructions exactly.`;
 
   let response;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), WEB_SEARCH_TIMEOUT_MS);
   try {
     response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -112,10 +142,16 @@ Write the cover letter body now, following the system instructions exactly.`;
         system: SYSTEM_PROMPT,
         tools: [{ type: "web_search_20250305", name: "web_search" }],
         messages: [{ role: "user", content: userMessage }]
-      })
+      }),
+      signal: controller.signal
     });
   } catch (networkErr) {
+    if (networkErr.name === "AbortError") {
+      return { success: false, error: `The request to Claude timed out after ${WEB_SEARCH_TIMEOUT_MS / 1000} seconds. This can happen when web search takes a while — try again.` };
+    }
     return { success: false, error: "Network error reaching the Anthropic API. Check your internet connection and try again." };
+  } finally {
+    clearTimeout(timeoutId);
   }
 
   if (!response.ok) {
@@ -206,6 +242,8 @@ ${resumeText}
 Extract this resume into the JSON schema now, following the system instructions exactly.`;
 
   let response;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
   try {
     response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -220,10 +258,16 @@ Extract this resume into the JSON schema now, following the system instructions 
         max_tokens: 4000,
         system: EXTRACT_RESUME_SYSTEM_PROMPT,
         messages: [{ role: "user", content: userMessage }]
-      })
+      }),
+      signal: controller.signal
     });
   } catch (networkErr) {
+    if (networkErr.name === "AbortError") {
+      return { success: false, error: `The request to Claude timed out after ${API_TIMEOUT_MS / 1000} seconds. Try again.` };
+    }
     return { success: false, error: "Network error reaching the Anthropic API. Check your internet connection and try again." };
+  } finally {
+    clearTimeout(timeoutId);
   }
 
   if (!response.ok) {
@@ -272,6 +316,134 @@ Extract this resume into the JSON schema now, following the system instructions 
   return { success: true, resumeJson };
 }
 
+const ANALYZE_RESUME_SKILLS_SYSTEM_PROMPT = `You are analyzing a job description against a real person's resume to find a skills gap. This is analysis only — you are not rewriting anything yet, just identifying what's missing.
+
+Steps:
+1. Extract the technical/ATS-relevant skills and keywords from the job description (tools, languages, platforms, methodologies, certifications — not soft skills like "team player" or "communication").
+2. Cross-reference each one against the candidate's existing skills list (provided below). Skip anything already listed there, including close synonyms/variants (e.g. if "PostgreSQL" is listed, don't also flag "Postgres").
+3. For each remaining skill (JD-relevant, not already on the resume), write ONE sentence explaining why the JD calls for it.
+4. Decide hasAdjacentEvidence: true if the candidate's existing experience/project bullets (also provided below) plausibly demonstrate this skill already, even if it isn't named as a skill outright (e.g. a bullet mentioning "built ETL pipelines in Airflow" supports adding "Apache Airflow" even if it wasn't in the skills list). Set it false if there is no bullet anywhere that plausibly supports the skill — this would be a bare, unsupported claim if added.
+
+If the job description asks for nothing the candidate doesn't already have, return an empty array — do not force a result.
+
+CRITICAL OUTPUT FORMAT: You may reason through the JD and resume first if needed. But the final result must be wrapped in <analysis_json></analysis_json> tags with absolutely nothing else inside those tags except a raw JSON array: no markdown code fences, no commentary. Everything outside the tags is discarded, so use that space for any reasoning, but the content inside <analysis_json></analysis_json> must be valid JSON matching this shape exactly:
+[{ "skill": "", "reason": "", "hasAdjacentEvidence": true }]`;
+
+function collectResumeBullets(resumeJson) {
+  const expBullets = (resumeJson.experience || []).flatMap((e) => e.bullets || []);
+  const projBullets = (resumeJson.projects || []).flatMap((p) => p.bullets || []);
+  return [...expBullets, ...projBullets];
+}
+
+async function analyzeResumeSkills({ jobDescriptionText }) {
+  const stored = await chrome.storage.local.get(["apiKey", "resumeJson"]);
+  const { apiKey, resumeJson } = stored;
+
+  if (!apiKey) {
+    return { success: false, error: "No Anthropic API key saved. Open the extension popup and add your API key in settings." };
+  }
+  if (!resumeJson || !resumeJson.name) {
+    return { success: false, error: "No structured resume saved. Open the extension popup and fill in (or auto-extract) your resume under Resume Tailoring." };
+  }
+  if (!jobDescriptionText || !jobDescriptionText.trim()) {
+    return { success: false, error: "No job description text found on this page." };
+  }
+
+  const existingSkills = (resumeJson.skills || []).join(", ") || "None listed";
+  const bullets = collectResumeBullets(resumeJson);
+  const existingBullets = bullets.length ? bullets.map((b) => `- ${b}`).join("\n") : "None listed";
+
+  const userMessage = `<job_description>
+${jobDescriptionText}
+</job_description>
+<existing_skills>
+${existingSkills}
+</existing_skills>
+<existing_bullets>
+${existingBullets}
+</existing_bullets>
+
+Analyze now, following the system instructions exactly.`;
+
+  let response;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true"
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 2000,
+        system: ANALYZE_RESUME_SKILLS_SYSTEM_PROMPT,
+        messages: [{ role: "user", content: userMessage }]
+      }),
+      signal: controller.signal
+    });
+  } catch (networkErr) {
+    if (networkErr.name === "AbortError") {
+      return { success: false, error: `The request to Claude timed out after ${API_TIMEOUT_MS / 1000} seconds. Try again.` };
+    }
+    return { success: false, error: "Network error reaching the Anthropic API. Check your internet connection and try again." };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (!response.ok) {
+    if (response.status === 401) {
+      return { success: false, error: "Anthropic API key was rejected (401). Double-check the key saved in the popup settings." };
+    }
+    if (response.status === 429) {
+      return { success: false, error: "Rate limited by the Anthropic API (429). Wait a moment and try again." };
+    }
+    let bodyText = "";
+    try {
+      const errJson = await response.json();
+      bodyText = errJson?.error?.message || "";
+    } catch (_) {}
+    return { success: false, error: `Anthropic API request failed (${response.status}). ${bodyText}`.trim() };
+  }
+
+  let data;
+  try {
+    data = await response.json();
+  } catch (parseErr) {
+    return { success: false, error: "Could not parse the response from the Anthropic API." };
+  }
+
+  const content = Array.isArray(data.content) ? data.content : [];
+  const fullText = content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n")
+    .trim();
+
+  const match = fullText.match(/<analysis_json>([\s\S]*?)<\/analysis_json>/);
+  const jsonText = match ? match[1].trim() : fullText.trim();
+
+  if (!jsonText) {
+    return { success: false, error: "Claude returned an empty response. This can happen if the request was declined — try again." };
+  }
+
+  let skills;
+  try {
+    skills = JSON.parse(jsonText);
+  } catch (parseErr) {
+    return { success: false, error: "Claude's response wasn't valid JSON, so it couldn't be parsed into the checklist. Try again." };
+  }
+
+  if (!Array.isArray(skills)) {
+    return { success: false, error: "Claude's response wasn't in the expected list format. Try again." };
+  }
+
+  return { success: true, skills };
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "GENERATE_COVER_LETTER") {
     generateCoverLetter(message)
@@ -281,6 +453,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message?.type === "EXTRACT_RESUME") {
     extractResume(message)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: `Unexpected error: ${err.message}` }));
+    return true;
+  }
+  if (message?.type === "ANALYZE_RESUME_SKILLS") {
+    analyzeResumeSkills(message)
       .then(sendResponse)
       .catch((err) => sendResponse({ success: false, error: `Unexpected error: ${err.message}` }));
     return true;

@@ -167,9 +167,69 @@ function buildUI() {
       cursor: pointer;
     }
     button.secondary-btn:hover { background: #e2dbc9; }
+    .fab-stack {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 10px;
+    }
+    .fab.resume-fab { background: #46467a; }
+    .fab.resume-fab:hover { background: #35355e; }
+    .checklist {
+      max-height: 220px;
+      overflow-y: auto;
+      margin-bottom: 10px;
+      padding-right: 2px;
+    }
+    .checklist-item {
+      border-bottom: 1px solid #e2dbc9;
+      padding: 8px 0;
+    }
+    .checklist-item:last-child { border-bottom: none; }
+    .checklist-item .checkbox-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+    }
+    .checklist-item input[type="checkbox"] {
+      margin-top: 2px;
+    }
+    .checklist-item .skill-name {
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .checklist-item .reason {
+      font-size: 11.5px;
+      color: #7a7566;
+      margin: 2px 0 0 22px;
+      line-height: 1.35;
+    }
+    .checklist-item .risk-marker {
+      display: inline-block;
+      font-size: 10.5px;
+      font-weight: 700;
+      color: #a33;
+      background: #fbeaea;
+      border-radius: 4px;
+      padding: 1px 5px;
+      margin-left: 6px;
+      vertical-align: middle;
+    }
   `;
   shadow.appendChild(style);
 
+  const stack = document.createElement("div");
+  stack.className = "fab-stack";
+
+  const resumeBody = buildResumeTailorWrapper(stack);
+  const coverLetterBody = buildCoverLetterWrapper(stack);
+
+  shadow.appendChild(stack);
+
+  return { coverLetterBody, resumeBody };
+}
+
+function buildCoverLetterWrapper(stack) {
   const wrapper = document.createElement("div");
   wrapper.style.position = "relative";
 
@@ -183,13 +243,40 @@ function buildUI() {
 
   wrapper.appendChild(fab);
   wrapper.appendChild(panel);
-  shadow.appendChild(wrapper);
+  stack.appendChild(wrapper);
 
   fab.addEventListener("click", () => {
     panel.classList.toggle("open");
     if (panel.classList.contains("open") && !panel.dataset.started) {
       panel.dataset.started = "true";
       runGenerationFlow(panel.querySelector(".body"));
+    }
+  });
+
+  return panel.querySelector(".body");
+}
+
+function buildResumeTailorWrapper(stack) {
+  const wrapper = document.createElement("div");
+  wrapper.style.position = "relative";
+
+  const fab = document.createElement("button");
+  fab.className = "fab resume-fab";
+  fab.textContent = "🧩 Tailor Resume";
+
+  const panel = document.createElement("div");
+  panel.className = "panel";
+  panel.innerHTML = `<h2>Resume Tailoring</h2><div class="body"></div>`;
+
+  wrapper.appendChild(fab);
+  wrapper.appendChild(panel);
+  stack.appendChild(wrapper);
+
+  fab.addEventListener("click", () => {
+    panel.classList.toggle("open");
+    if (panel.classList.contains("open") && !panel.dataset.started) {
+      panel.dataset.started = "true";
+      runResumeTailorFlow(panel.querySelector(".body"));
     }
   });
 
@@ -204,14 +291,14 @@ const LOADING_MESSAGES = [
   "Polishing the letter..."
 ];
 
-function renderLoading(container) {
-  container.innerHTML = `<div class="status" id="loading-status">${LOADING_MESSAGES[0]}</div>`;
+function renderLoading(container, messages = LOADING_MESSAGES) {
+  container.innerHTML = `<div class="status" id="loading-status">${messages[0]}</div>`;
   let i = 0;
   const statusEl = container.querySelector("#loading-status");
   const interval = setInterval(() => {
-    i = (i + 1) % LOADING_MESSAGES.length;
+    i = (i + 1) % messages.length;
     if (statusEl.isConnected) {
-      statusEl.textContent = LOADING_MESSAGES[i];
+      statusEl.textContent = messages[i];
     } else {
       clearInterval(interval);
     }
@@ -219,13 +306,13 @@ function renderLoading(container) {
   return () => clearInterval(interval);
 }
 
-function renderError(container, message) {
+function renderError(container, message, onRetry) {
   container.innerHTML = `
     <div class="error-msg">${escapeHtml(message)}</div>
     <div class="error-msg">If this is a settings issue, open the extension popup to check your saved API key or resume.</div>
     <button class="action-btn" id="retry-btn">Try Again</button>
   `;
-  container.querySelector("#retry-btn").addEventListener("click", () => runGenerationFlow(container));
+  container.querySelector("#retry-btn").addEventListener("click", () => onRetry(container));
 }
 
 function renderManualPasteFallback(container, onSubmit) {
@@ -321,13 +408,39 @@ async function buildAndDownloadPdf({ letterText, companyName, jobTitle }) {
   return filename;
 }
 
-function requestGeneration({ jobTitle, companyName, jobDescriptionText }) {
+// Client-side safety net: background.js's own API-call timeouts (see
+// WEB_SEARCH_TIMEOUT_MS/API_TIMEOUT_MS there) should always produce a real
+// error response before this fires. This is only a backstop for the case
+// those timeouts don't cover — e.g. the MV3 service worker itself getting
+// terminated mid-request, which can silently drop the message port instead
+// of ever calling sendResponse. Without this, the panel would sit in
+// renderLoading()'s cycling-messages state forever with no way out.
+const SAFETY_NET_TIMEOUT_MS = 65000; // background ceiling (55s) + buffer
+
+function sendMessageWithSafetyNet(message, timeoutErrorText) {
   return new Promise((resolve) => {
-    chrome.runtime.sendMessage(
-      { type: "GENERATE_COVER_LETTER", jobTitle, companyName, jobDescriptionText },
-      (response) => resolve(response)
-    );
+    let settled = false;
+
+    const safetyTimer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ success: false, error: timeoutErrorText });
+    }, SAFETY_NET_TIMEOUT_MS);
+
+    chrome.runtime.sendMessage(message, (response) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(safetyTimer);
+      resolve(response);
+    });
   });
+}
+
+function requestGeneration({ jobTitle, companyName, jobDescriptionText }) {
+  return sendMessageWithSafetyNet(
+    { type: "GENERATE_COVER_LETTER", jobTitle, companyName, jobDescriptionText },
+    "Didn't hear back in time. This can happen if the background process was interrupted — try again."
+  );
 }
 
 async function runGenerationFlow(container) {
@@ -350,7 +463,7 @@ async function runGenerationFlowWithDescription(container, jobTitle, companyName
   stopLoading();
 
   if (!response || !response.success) {
-    renderError(container, response?.error || "Something went wrong generating the letter.");
+    renderError(container, response?.error || "Something went wrong generating the letter.", runGenerationFlow);
     return;
   }
 
@@ -358,8 +471,119 @@ async function runGenerationFlowWithDescription(container, jobTitle, companyName
     const filename = await buildAndDownloadPdf(response);
     renderSuccess(container, filename, response.letterText);
   } catch (err) {
-    renderError(container, `Failed to build the PDF: ${err.message}`);
+    renderError(container, `Failed to build the PDF: ${err.message}`, runGenerationFlow);
   }
+}
+
+// ----------------------------------------------------------------------------
+// D. Resume Tailoring flow (separate button, separate state, independent of
+// the cover letter flow above — shares only the generic renderLoading/
+// renderError/renderManualPasteFallback helpers, which just render into
+// whatever container they're given).
+// ----------------------------------------------------------------------------
+const RESUME_ANALYSIS_LOADING_MESSAGES = [
+  "Reading the job posting...",
+  "Comparing it against your resume's skills...",
+  "Checking which skills have supporting evidence..."
+];
+
+function renderNoNewSkills(container, onRerun) {
+  container.innerHTML = `
+    <div class="status">Your resume already covers the skills this job description asks for. No new skills to add.</div>
+    <button class="secondary-btn" id="rerun-btn">Re-check</button>
+  `;
+  container.querySelector("#rerun-btn").addEventListener("click", () => onRerun(container));
+}
+
+function renderChecklist(container, skills, onContinue) {
+  const itemsHtml = skills
+    .map((s, i) => {
+      const riskMarker = s.hasAdjacentEvidence === false
+        ? `<span class="risk-marker" title="No supporting bullet found elsewhere in your resume">no evidence found</span>`
+        : "";
+      return `
+        <div class="checklist-item">
+          <div class="checkbox-row">
+            <input type="checkbox" id="skill-${i}" checked />
+            <label for="skill-${i}"><span class="skill-name">${escapeHtml(s.skill)}</span>${riskMarker}</label>
+          </div>
+          <div class="reason">${escapeHtml(s.reason || "")}</div>
+        </div>
+      `;
+    })
+    .join("");
+
+  container.innerHTML = `
+    <div class="status">Skills this job description asks for that aren't on your resume yet — uncheck any you don't want added:</div>
+    <div class="checklist">${itemsHtml}</div>
+    <button class="action-btn" id="checklist-continue-btn">Continue</button>
+  `;
+
+  container.querySelector("#checklist-continue-btn").addEventListener("click", () => {
+    const approved = skills.filter((_, i) => container.querySelector(`#skill-${i}`).checked);
+    onContinue(approved);
+  });
+}
+
+function renderTailorNotBuiltYet(container, approvedSkills, onRestart) {
+  const list = approvedSkills.length
+    ? `<ul>${approvedSkills.map((s) => `<li>${escapeHtml(s.skill)}</li>`).join("")}</ul>`
+    : "<div class=\"status\">(none selected)</div>";
+
+  container.innerHTML = `
+    <div class="status">Approved skills, ready for the resume rewrite step:</div>
+    ${list}
+    <div class="status">Resume rewriting isn't built yet — this is as far as this flow goes for now.</div>
+    <button class="secondary-btn" id="restart-btn">Start Over</button>
+  `;
+  container.querySelector("#restart-btn").addEventListener("click", () => onRestart(container));
+}
+
+function requestResumeAnalysis({ jobDescriptionText }) {
+  return sendMessageWithSafetyNet(
+    { type: "ANALYZE_RESUME_SKILLS", jobDescriptionText },
+    "Didn't hear back in time. This can happen if the background process was interrupted — try again."
+  );
+}
+
+async function runResumeTailorFlow(container) {
+  const { jobDescriptionText } = extractJobContext();
+
+  if (!jobDescriptionText || jobDescriptionText.length < 100) {
+    renderManualPasteFallback(container, async (manualText) => {
+      await runResumeAnalysisWithDescription(container, manualText);
+    });
+    return;
+  }
+
+  await runResumeAnalysisWithDescription(container, jobDescriptionText);
+}
+
+async function runResumeAnalysisWithDescription(container, jobDescriptionText) {
+  const stopLoading = renderLoading(container, RESUME_ANALYSIS_LOADING_MESSAGES);
+
+  const response = await requestResumeAnalysis({ jobDescriptionText });
+  stopLoading();
+
+  if (!response || !response.success) {
+    renderError(container, response?.error || "Something went wrong analyzing the job description.", runResumeTailorFlow);
+    return;
+  }
+
+  const skills = Array.isArray(response.skills) ? response.skills : [];
+
+  if (skills.length === 0) {
+    renderNoNewSkills(container, runResumeTailorFlow);
+    return;
+  }
+
+  renderChecklist(container, skills, (approvedSkills) => {
+    // TAILOR_RESUME (the actual rewrite call) isn't built yet — this is a
+    // deliberate stub for this pass. Approved skills are logged so the next
+    // session can wire them straight into that call.
+    console.log("Resume tailoring — approved skills (TAILOR_RESUME not yet implemented):", approvedSkills);
+    renderTailorNotBuiltYet(container, approvedSkills, runResumeTailorFlow);
+  });
 }
 
 // ----------------------------------------------------------------------------
