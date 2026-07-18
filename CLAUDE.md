@@ -94,11 +94,14 @@ Build order (per session plan, do not reorder):
     saving — replaces typing the form out from scratch. See below.
 2. ✅ `ANALYZE_RESUME_SKILLS` call + checklist panel state — built, pending
    live-test against a real JD (see below).
-3. ⬜ `TAILOR_RESUME` call with hard constraints, verified (before/after JSON
-   diff) that it never fabricates experience. Currently stubbed — see below.
-4. ⬜ HTML render + one-page enforcement + PDF download (generic layout
-   first, real visual spec to follow later).
-5. ⬜ Filename inference from `sourceFilename`'s naming pattern.
+3. ✅ `TAILOR_RESUME` call with hard constraints — built, pending live-test
+   (before/after JSON diff) that it never fabricates experience. See below.
+4. ✅ HTML render + one-page enforcement + PDF download — built with a
+   generic layout, **will need revisiting once a real visual spec is
+   provided** (see below).
+5. ⬜ Filename inference from `sourceFilename`'s naming pattern — currently a
+   simple suffix (`_Tailored` before the extension), not the full
+   pattern-parsing step described in the original spec. See below.
 
 ### Step 1b — auto-extraction ("Call 0") (done, not yet live-tested)
 
@@ -253,29 +256,118 @@ Build order (per session plan, do not reorder):
   no gap (empty-array path → `renderNoNewSkills`), and the manual-paste
   fallback path for a JD-light page.
 
-### Planned design decisions for later steps (recorded now so they survive a cold pickup)
+### Steps 3 + 4 — `TAILOR_RESUME`/`COMPRESS_RESUME` + one-page PDF (done, not yet live-tested)
+
+- The checklist's "Continue" handler in `content.js` no longer stubs out —
+  `renderTailorNotBuiltYet()` was deleted (not left as dead code) and
+  replaced by `runTailorResumeFlow(container, jobDescriptionText,
+  approvedSkills)`, which drives loading → the real rewrite call → render →
+  download → success/error, all in the same checklist-continuation path.
+- New `TAILOR_RESUME` message in `background.js`: `tailorResume({
+  jobDescriptionText, approvedSkills })` reads `apiKey`/`resumeJson` from
+  storage (same pattern as the other calls), sends the full `resumeJson`
+  (not just skills) plus the JD and the approved skill names to
+  `claude-sonnet-4-6` with no web search. System prompt's single hard rule —
+  **never add a new `experience`/`projects` entry, only rephrase/reorder/
+  expand existing bullets** — is stated with two bad-example/good-example
+  pairs (one for inventing a whole new project, one for fabricating within
+  an existing bullet), same structural approach as the `<letter>` rule and
+  `EXTRACT_RESUME`'s extraction-only rule. Output wrapped in
+  `<resume_json>{...}</resume_json>`, parsed with the same
+  tag-match-else-fallback + `JSON.parse` + clear-error pattern as
+  `EXTRACT_RESUME`. After parsing, `name`/`contact`/`education`/
+  `sourceFilename` are force-overwritten back to the original input's values
+  regardless of what the model returned — a defensive normalization so a
+  model slip on a field it was told not to touch can't silently corrupt the
+  download filename or contact info downstream.
+- **Keyword density is stated explicitly in the system prompt as the
+  opposite dial from the cover letter's**: 2-3 varied-phrasing placements
+  per primary keyword (not 1-2 verbatim like the cover letter), with an
+  inline note in the prompt string itself (not just a code comment) so a
+  future session tuning one prompt doesn't reflexively "fix" the other into
+  matching it. Also instructs prioritizing keyword placement in the FIRST
+  bullet of the most relevant existing entry (ATS/skimmer weighting), and
+  folds the approved checklist skills into `skills` without removing any
+  existing ones.
+- New `COMPRESS_RESUME` message: a separate, narrower call (`compressResume`)
+  used only for the one-page-overflow compression pass — same tag/parse/
+  defensive-normalization pattern, but its system prompt is scoped tighter
+  ("tighten by ~15%, never drop a bullet/entry/skill, no new claims") since
+  by this point the resume is already tailored and just needs to get
+  shorter, not rewritten again.
+- **One-page enforcement, in `content.js`** (`fitResumeToOnePage`): builds an
+  off-screen (`position:fixed; left:-99999px`, not `display:none`, so
+  `scrollHeight` is real) page element at exactly `816x1056px` (8.5x11in @
+  96dpi) with `RESUME_MARGIN_PX = 48` (0.5in) baked into its own padding —
+  the same box that's measured is the same box that's rendered, no separate
+  margin math to keep in sync. Order matches the spec exactly: if
+  `scrollHeight > 1056`, first request one `COMPRESS_RESUME` pass and
+  re-measure; only if *still* overflowing after that does it start
+  decrementing `fontSizePt` by 0.5 in a loop, floored at
+  `RESUME_FONT_FLOOR_PT = 10`. If it's still over the floor at 10pt, the
+  function returns `fits:false` and the caller proceeds anyway — there's no
+  further lever that doesn't mean fabricating a shorter resume, which is
+  out of scope for this pass. Not yet surfaced to the user when this happens
+  (see open items below).
+- **HTML template** (`buildResumeHtml`): plain single-column ATS-safe layout
+  — Arial/Helvetica, no tables/icons/multi-column, section order name+contact
+  header → summary → skills → experience → projects → education (matches
+  the spec's requested order). **This is a placeholder layout, not a real
+  visual spec** — built this way because there was nothing to match against
+  yet. **Will need to be revisited once a real visual spec is provided** (see
+  open items below) — likely a significant rewrite of `buildResumeHtml`,
+  not just a tweak, since matching an exact existing resume's fonts/spacing/
+  section styling is a different task than "generic ATS-safe."
+- **PDF render/download**: `html2pdf.js` bundled locally as
+  `html2pdf.bundle.min.js` (npm `html2pdf.js@0.14.0`, the UMD bundle build —
+  confirmed it sets `window.html2pdf`, same non-module classic-script
+  pattern as `jspdf.umd.min.js`), added to `manifest.json`'s
+  `content_scripts.js` array before `content.js`. Deliberately kept fully
+  separate from the cover letter's jsPDF path — `buildAndDownloadPdf()` (cover
+  letter) and `downloadTailoredResumePdf()` (resume tailoring) don't share
+  any code, matching the instruction not to cross-wire them. `jsPDF`'s
+  `unit: "px"` with `format: [816, 1056]` is passed straight through
+  html2pdf's own vendored jsPDF so the physical PDF page matches the
+  816x1056px measurement box exactly.
+- **Filename** (step 5, minimal version only): `buildTailoredFilename()` is
+  a simple suffix — inserts `_Tailored` before the source filename's
+  extension (or appends `_Tailored.pdf` if there's no extension, or falls
+  back to a static `Tailored_Resume.pdf` if `sourceFilename` is empty). This
+  is deliberately not the full naming-pattern-inference step described in
+  the original spec (parsing where a role/variant tag sits in the filename,
+  etc.) — that's saved for a dedicated future pass since it's "cosmetic and
+  easiest to get wrong in a way that doesn't matter functionally," per the
+  original build-order rationale.
+- **Not yet live-tested** — pending, in rough priority order: (1) a
+  before/after JSON diff on a real resume to confirm `TAILOR_RESUME` never
+  adds a new experience/project entry — the single most safety-critical
+  check in this whole feature; (2) a real JD/resume pair that actually
+  triggers PDF overflow, to confirm the compress-then-shrink-font sequence
+  fires in the right order and produces a real one-page PDF; (3) the "still
+  overflowing even at the 10pt floor" case, which currently has no explicit
+  user-facing message (the PDF just downloads as-is); (4) the generic HTML
+  layout's actual visual output once opened as a PDF (font sizes read as
+  pt correctly, bullets/sections don't clip oddly, `html2canvas`'s `scale: 2`
+  doesn't blur small text).
+
+### Design decisions carried through from planning into steps 3-4 (now implemented — see that section above for the actual code)
 
 - **Keyword density is the opposite dial from the cover letter prompt, on
-  purpose.** Cover letter: 1-2 mirrored JD terms max (sounds like a person,
-  not an ATS-stuffed doc). Resume tailoring (step 3): primary JD keywords
-  should land 2-3 times across the resume in different phrasing/context, not
-  verbatim repetition — resumes get ATS-parsed before a human ever reads
-  them, so the goals genuinely differ. When writing the `TAILOR_RESUME`
-  system prompt, note this inline as a code comment so a future session
-  doesn't "fix" it into consistency with the cover letter prompt.
-- **No new experience/project entries, ever** is the single most important
-  rule for step 3's system prompt — plan to state it the same structural way
-  the `<letter>` tag rule works (a bad-example/good-example pair, not just a
-  stated rule), backed by the same "wrap output in tags, discard everything
-  else" pattern: `<analysis_json>` for step 2's output, `<resume_json>` for
-  step 3's, both with the same fallback-to-full-text-if-tags-missing
-  behavior as `<letter>` in `background.js`.
-- Step 4 will use `html2pdf.js` bundled locally (no CDN, per the existing
-  "no remote code" constraint) — reserved for the resume-tailoring PDF only;
-  `jspdf.umd.min.js` stays dedicated to the cover letter path, not cross-wired.
-- One-page enforcement order matters: LLM compression pass first ("tighten
-  by ~15%, keep keywords and the specific metric"), only reduce
-  font-size/line-height as a last resort, floor at 10pt.
+  purpose.** Cover letter: 1-2 mirrored JD terms max. Resume tailoring:
+  primary JD keywords land 2-3 times in varied phrasing — resumes get
+  ATS-parsed before a human reads them, so the goals genuinely differ. Now
+  stated explicitly in `TAILOR_RESUME_SYSTEM_PROMPT` itself (not just a code
+  comment) so a future session tuning one prompt doesn't "fix" it into
+  matching the other.
+- **No new experience/project entries, ever** — implemented as
+  `TAILOR_RESUME_SYSTEM_PROMPT`'s single hard rule, stated with bad/good
+  example pairs, same structural approach as the `<letter>` rule.
+- `html2pdf.js` bundled locally, resume-tailoring PDF only;
+  `jspdf.umd.min.js` stays dedicated to the cover letter path — implemented,
+  not cross-wired.
+- One-page enforcement order — LLM compression pass first, font-size
+  reduction only as a last resort, floor at 10pt — implemented exactly as
+  planned in `fitResumeToOnePage()`.
 
 ## Files
 
@@ -284,9 +376,13 @@ Build order (per session plan, do not reorder):
   `api.github.com`.
 - `jspdf.umd.min.js` — jsPDF bundled locally (not CDN-loaded), loaded before
   `content.js` in content_scripts so `window.jspdf` is available. Dedicated
-  to the cover letter PDF path — the resume tailoring feature's PDF output
-  (step 4, not yet built) will use `html2pdf.js` instead, kept separate per
-  the plan in the Resume Tailoring section below.
+  to the cover letter PDF path — `buildAndDownloadPdf()` — never touched by
+  the resume tailoring feature.
+- `html2pdf.bundle.min.js` — html2pdf.js bundled locally (npm
+  `html2pdf.js@0.14.0`, UMD bundle build, not CDN-loaded), loaded before
+  `content.js` in content_scripts so `window.html2pdf` is available.
+  Dedicated to the resume tailoring PDF path — `downloadTailoredResumePdf()`
+  — kept fully separate from the cover letter's jsPDF path.
 - `pdfjs/pdf.min.mjs` / `pdfjs/pdf.worker.min.mjs` — pdf.js bundled locally
   (`pdfjs-dist@6.1.200`, ESM build, not CDN-loaded), dynamically imported
   from `popup.js` to extract text from an uploaded resume PDF client-side

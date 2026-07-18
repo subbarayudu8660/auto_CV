@@ -525,18 +525,13 @@ function renderChecklist(container, skills, onContinue) {
   });
 }
 
-function renderTailorNotBuiltYet(container, approvedSkills, onRestart) {
-  const list = approvedSkills.length
-    ? `<ul>${approvedSkills.map((s) => `<li>${escapeHtml(s.skill)}</li>`).join("")}</ul>`
-    : "<div class=\"status\">(none selected)</div>";
-
+function renderResumeDownloadSuccess(container, filename, onRestart) {
   container.innerHTML = `
-    <div class="status">Approved skills, ready for the resume rewrite step:</div>
-    ${list}
-    <div class="status">Resume rewriting isn't built yet — this is as far as this flow goes for now.</div>
-    <button class="secondary-btn" id="restart-btn">Start Over</button>
+    <div class="status">Downloaded:</div>
+    <div class="filename">${escapeHtml(filename)}</div>
+    <button class="secondary-btn" id="resume-restart-btn">Start Over</button>
   `;
-  container.querySelector("#restart-btn").addEventListener("click", () => onRestart(container));
+  container.querySelector("#resume-restart-btn").addEventListener("click", () => onRestart(container));
 }
 
 function requestResumeAnalysis({ jobDescriptionText }) {
@@ -578,12 +573,227 @@ async function runResumeAnalysisWithDescription(container, jobDescriptionText) {
   }
 
   renderChecklist(container, skills, (approvedSkills) => {
-    // TAILOR_RESUME (the actual rewrite call) isn't built yet — this is a
-    // deliberate stub for this pass. Approved skills are logged so the next
-    // session can wire them straight into that call.
-    console.log("Resume tailoring — approved skills (TAILOR_RESUME not yet implemented):", approvedSkills);
-    renderTailorNotBuiltYet(container, approvedSkills, runResumeTailorFlow);
+    runTailorResumeFlow(container, jobDescriptionText, approvedSkills);
   });
+}
+
+// ----------------------------------------------------------------------------
+// E. Tailored resume render + one-page PDF (this feature's own path — does
+// not touch jspdf.umd.min.js or buildAndDownloadPdf() above, which stay
+// dedicated to the cover letter. Uses html2pdf.js, bundled locally.)
+// ----------------------------------------------------------------------------
+const TAILOR_LOADING_MESSAGES = [
+  "Reading the job description...",
+  "Weaving in relevant keywords...",
+  "Making sure it still fits one page..."
+];
+
+// 8.5x11in at 96dpi, per the one-page spec. Margin is baked into the page
+// element's padding rather than passed to html2pdf's own margin option, so
+// the same box is what gets measured AND what gets rendered.
+const RESUME_PAGE_WIDTH_PX = 816;
+const RESUME_PAGE_HEIGHT_PX = 1056;
+const RESUME_MARGIN_PX = 48; // 0.5in
+const RESUME_FONT_FLOOR_PT = 10;
+
+function requestTailorResume({ jobDescriptionText, approvedSkills }) {
+  return sendMessageWithSafetyNet(
+    { type: "TAILOR_RESUME", jobDescriptionText, approvedSkills },
+    "Didn't hear back in time. This can happen if the background process was interrupted — try again."
+  );
+}
+
+function requestCompressResume({ resumeJson }) {
+  return sendMessageWithSafetyNet(
+    { type: "COMPRESS_RESUME", resumeJson },
+    "Didn't hear back in time while tightening the resume to fit one page — try again."
+  );
+}
+
+function resumeSectionHeadingHtml(text, fontSizePt) {
+  return `<div style="font-size:${fontSizePt}pt;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;border-bottom:1px solid #333;margin:12px 0 6px;padding-bottom:2px;">${escapeHtml(text)}</div>`;
+}
+
+// Generic single-column ATS-safe layout — no tables, no icons, no columns.
+// There's no real visual spec to match yet; this is a placeholder to replace
+// once one is provided (see CLAUDE.md).
+function buildResumeHtml(resumeJson, fontSizePt) {
+  const smallPt = Math.max(fontSizePt - 1, RESUME_FONT_FLOOR_PT - 1);
+  const contact = resumeJson.contact || {};
+  const contactLine = [contact.email, contact.phone, contact.location, contact.linkedin, contact.github, contact.portfolio]
+    .filter(Boolean)
+    .map(escapeHtml)
+    .join("  |  ");
+
+  let html = `<div style="font-family: Arial, Helvetica, sans-serif; font-size:${fontSizePt}pt; line-height:1.35; color:#111;">`;
+
+  html += `<div style="text-align:center; margin-bottom:10px;">
+    <div style="font-size:${fontSizePt + 6}pt; font-weight:700;">${escapeHtml(resumeJson.name || "")}</div>
+    <div style="font-size:${smallPt}pt; color:#333; margin-top:2px;">${contactLine}</div>
+  </div>`;
+
+  if (resumeJson.summary) {
+    html += resumeSectionHeadingHtml("Summary", fontSizePt);
+    html += `<div style="margin-bottom:6px;">${escapeHtml(resumeJson.summary)}</div>`;
+  }
+
+  if (Array.isArray(resumeJson.skills) && resumeJson.skills.length) {
+    html += resumeSectionHeadingHtml("Skills", fontSizePt);
+    html += `<div style="margin-bottom:6px;">${escapeHtml(resumeJson.skills.join(", "))}</div>`;
+  }
+
+  if (Array.isArray(resumeJson.experience) && resumeJson.experience.length) {
+    html += resumeSectionHeadingHtml("Experience", fontSizePt);
+    resumeJson.experience.forEach((entry) => {
+      const titleLine = [entry.title, entry.org].filter(Boolean).map(escapeHtml).join(", ");
+      html += `<div style="margin-bottom:8px;">
+        <div style="display:flex; justify-content:space-between;">
+          <span style="font-weight:700;">${titleLine}</span>
+          <span>${escapeHtml(entry.dates || "")}</span>
+        </div>
+        ${entry.location ? `<div style="font-style:italic; font-size:${smallPt}pt;">${escapeHtml(entry.location)}</div>` : ""}
+        <ul style="margin:4px 0 0 18px; padding:0;">
+          ${(entry.bullets || []).map((b) => `<li style="margin-bottom:2px;">${escapeHtml(b)}</li>`).join("")}
+        </ul>
+      </div>`;
+    });
+  }
+
+  if (Array.isArray(resumeJson.projects) && resumeJson.projects.length) {
+    html += resumeSectionHeadingHtml("Projects", fontSizePt);
+    resumeJson.projects.forEach((entry) => {
+      html += `<div style="margin-bottom:8px;">
+        <div style="display:flex; justify-content:space-between;">
+          <span style="font-weight:700;">${escapeHtml(entry.name || "")}</span>
+          <span>${escapeHtml(entry.dates || "")}</span>
+        </div>
+        <ul style="margin:4px 0 0 18px; padding:0;">
+          ${(entry.bullets || []).map((b) => `<li style="margin-bottom:2px;">${escapeHtml(b)}</li>`).join("")}
+        </ul>
+      </div>`;
+    });
+  }
+
+  const edu = resumeJson.education;
+  if (edu && (edu.school || edu.degree)) {
+    html += resumeSectionHeadingHtml("Education", fontSizePt);
+    const eduLine = [edu.school, edu.degree].filter(Boolean).map(escapeHtml).join(", ");
+    html += `<div style="display:flex; justify-content:space-between;">
+      <span style="font-weight:700;">${eduLine}</span>
+      <span>${escapeHtml(edu.dates || "")}</span>
+    </div>`;
+    if (edu.details) {
+      html += `<div>${escapeHtml(edu.details)}</div>`;
+    }
+  }
+
+  html += `</div>`;
+  return html;
+}
+
+function createResumePageElement(resumeJson, fontSizePt) {
+  const div = document.createElement("div");
+  // Off-screen but still laid out (not display:none) so scrollHeight reflects
+  // real rendered height for the overflow check below.
+  div.style.position = "fixed";
+  div.style.left = "-99999px";
+  div.style.top = "0";
+  div.style.width = `${RESUME_PAGE_WIDTH_PX}px`;
+  div.style.boxSizing = "border-box";
+  div.style.padding = `${RESUME_MARGIN_PX}px`;
+  div.style.background = "#ffffff";
+  div.innerHTML = buildResumeHtml(resumeJson, fontSizePt);
+  return div;
+}
+
+// One-page enforcement order: LLM compression pass first (preserves content,
+// just tightens wording), only reduce font-size as a last resort, floor at
+// 10pt. Never drops content on its own — if still overflowing at the floor,
+// this returns fits:false and the caller proceeds anyway (best effort; there
+// is no further lever that doesn't mean fabricating a shorter resume).
+async function fitResumeToOnePage(resumeJson, statusCallback) {
+  let currentJson = resumeJson;
+  let fontSizePt = 11;
+
+  let pageEl = createResumePageElement(currentJson, fontSizePt);
+  document.body.appendChild(pageEl);
+  let height = pageEl.scrollHeight;
+
+  if (height > RESUME_PAGE_HEIGHT_PX) {
+    pageEl.remove();
+    if (statusCallback) statusCallback("Tightening bullets to fit one page...");
+    const compressResponse = await requestCompressResume({ resumeJson: currentJson });
+    if (compressResponse && compressResponse.success) {
+      currentJson = compressResponse.resumeJson;
+    }
+    pageEl = createResumePageElement(currentJson, fontSizePt);
+    document.body.appendChild(pageEl);
+    height = pageEl.scrollHeight;
+  }
+
+  while (height > RESUME_PAGE_HEIGHT_PX && fontSizePt > RESUME_FONT_FLOOR_PT) {
+    pageEl.remove();
+    fontSizePt -= 0.5;
+    pageEl = createResumePageElement(currentJson, fontSizePt);
+    document.body.appendChild(pageEl);
+    height = pageEl.scrollHeight;
+  }
+
+  return { resumeJson: currentJson, pageEl, fits: height <= RESUME_PAGE_HEIGHT_PX };
+}
+
+// Simple suffix on the source filename's own extension — full naming-pattern
+// inference (step 5) is a separate, later step.
+function buildTailoredFilename(sourceFilename) {
+  if (!sourceFilename) return "Tailored_Resume.pdf";
+  const dotIndex = sourceFilename.lastIndexOf(".");
+  if (dotIndex === -1) return `${sourceFilename}_Tailored.pdf`;
+  return `${sourceFilename.slice(0, dotIndex)}_Tailored${sourceFilename.slice(dotIndex)}`;
+}
+
+async function downloadTailoredResumePdf(resumeJson, statusCallback) {
+  const { pageEl } = await fitResumeToOnePage(resumeJson, statusCallback);
+  const filename = buildTailoredFilename(resumeJson.sourceFilename);
+
+  try {
+    await window.html2pdf().set({
+      margin: 0, // margin is already baked into pageEl's padding
+      filename,
+      jsPDF: { unit: "px", format: [RESUME_PAGE_WIDTH_PX, RESUME_PAGE_HEIGHT_PX], orientation: "portrait" },
+      html2canvas: { scale: 2, windowWidth: RESUME_PAGE_WIDTH_PX }
+    }).from(pageEl).save();
+  } finally {
+    pageEl.remove();
+  }
+
+  return filename;
+}
+
+async function runTailorResumeFlow(container, jobDescriptionText, approvedSkills) {
+  const stopLoading = renderLoading(container, TAILOR_LOADING_MESSAGES);
+
+  const response = await requestTailorResume({
+    jobDescriptionText,
+    approvedSkills: approvedSkills.map((s) => s.skill)
+  });
+
+  if (!response || !response.success) {
+    stopLoading();
+    renderError(container, response?.error || "Something went wrong tailoring the resume.", runResumeTailorFlow);
+    return;
+  }
+
+  try {
+    const filename = await downloadTailoredResumePdf(response.resumeJson, (msg) => {
+      const statusEl = container.querySelector("#loading-status");
+      if (statusEl && statusEl.isConnected) statusEl.textContent = msg;
+    });
+    stopLoading();
+    renderResumeDownloadSuccess(container, filename, runResumeTailorFlow);
+  } catch (err) {
+    stopLoading();
+    renderError(container, `Failed to build the tailored resume PDF: ${err.message}`, runResumeTailorFlow);
+  }
 }
 
 // ----------------------------------------------------------------------------

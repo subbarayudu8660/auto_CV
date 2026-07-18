@@ -444,6 +444,253 @@ Analyze now, following the system instructions exactly.`;
   return { success: true, skills };
 }
 
+const TAILOR_RESUME_SYSTEM_PROMPT = `You are tailoring a real person's resume to a specific job description. This is a rewrite pass with one absolute boundary: you are editing what already exists, never inventing what doesn't.
+
+CRITICAL RULE, THE MOST IMPORTANT ONE IN THIS PROMPT: Never add a new entry to "experience" or "projects." Every entry in the output arrays must correspond to an entry that was already in the input resume — same title/org or same project name. Within an existing entry, you may rephrase, reorder, or expand its existing bullets (and only its existing bullets), but you may not invent a bullet describing work, a tool, or a result that has no basis in the input. If the job description calls for something the resume has zero evidence for anywhere, leave it out of the bullets entirely — it can only go into "skills" (see below), never fabricated into a bullet as if it were experience.
+
+Bad (inventing a new project to chase the JD):
+Input resume has 2 projects. Job description mentions Kubernetes, which appears nowhere in the input.
+Bad output: a 3rd project entry, "Container Orchestration Pipeline," that doesn't exist in the input.
+
+Bad (fabricating within an existing bullet):
+Input bullet: "Built a dashboard in Tableau for the sales team"
+Bad output: "Built a dashboard in Tableau and deployed it via a Kubernetes-orchestrated CI/CD pipeline for the sales team" (the Kubernetes/CI/CD part has no basis anywhere in the input resume)
+
+Good (rephrasing/expanding an existing bullet using only what's already there, while working in a real JD keyword the resume already supports):
+Input bullet: "Built a dashboard in Tableau for the sales team"
+Job description keyword: "data visualization"
+Good output: "Built a Tableau data visualization dashboard adopted by the sales team for weekly pipeline reviews" (same underlying fact, tighter ATS phrasing, no new claim)
+
+Keyword weaving:
+- Target each primary JD keyword landing 2-3 times across the resume in different phrasing/context — not verbatim copy-pasted the same way each time, and not just once. (This is the OPPOSITE density target from a cover letter, which mirrors only 1-2 terms once each to avoid sounding ATS-stuffed. A resume is machine-parsed before a human ever reads it, so repetition across a few varied bullets is the correct goal here, not a mistake to fix.)
+- Prioritize placing a keyword in the FIRST bullet of whichever existing experience or project entry is most relevant to the job description — ATS parsers and human skimmers both weight the first bullet of an entry more heavily than one buried at the bottom of a list.
+- Only place a keyword where it's honestly supported by that entry's existing content. Do not force an unrelated keyword into an entry it doesn't fit.
+
+Skills:
+- Fold the approved new skills (provided below) into the "skills" array, alongside the existing skills. Do not add any skill beyond what was explicitly approved.
+- Do not remove any existing skill.
+
+Other rules:
+- No em dashes (—) anywhere in the output. Use periods, commas, or parentheses instead.
+- Do not change "name", "contact", "education", or "sourceFilename" — pass them through unchanged from the input.
+- Do not reorder or restructure the resume's sections — this is a content-tailoring pass, not a redesign.
+
+CRITICAL OUTPUT FORMAT: You may reason through your approach first if needed. But the final result must be wrapped in <resume_json></resume_json> tags with absolutely nothing else inside those tags except the raw JSON object: no markdown code fences, no commentary. Everything outside the tags is discarded, so use that space for any reasoning, but the content inside <resume_json></resume_json> must be valid JSON matching the same schema as the input resume exactly.`;
+
+async function tailorResume({ jobDescriptionText, approvedSkills }) {
+  const stored = await chrome.storage.local.get(["apiKey", "resumeJson"]);
+  const { apiKey, resumeJson } = stored;
+
+  if (!apiKey) {
+    return { success: false, error: "No Anthropic API key saved. Open the extension popup and add your API key in settings." };
+  }
+  if (!resumeJson || !resumeJson.name) {
+    return { success: false, error: "No structured resume saved. Open the extension popup and fill in (or auto-extract) your resume under Resume Tailoring." };
+  }
+  if (!jobDescriptionText || !jobDescriptionText.trim()) {
+    return { success: false, error: "No job description text found on this page." };
+  }
+
+  const approvedSkillsList = Array.isArray(approvedSkills) ? approvedSkills : [];
+  const approvedSkillsText = approvedSkillsList.length ? approvedSkillsList.join(", ") : "None approved";
+
+  const userMessage = `<job_description>
+${jobDescriptionText}
+</job_description>
+<resume_json>
+${JSON.stringify(resumeJson)}
+</resume_json>
+<approved_new_skills>
+${approvedSkillsText}
+</approved_new_skills>
+
+Tailor this resume now, following the system instructions exactly.`;
+
+  let response;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true"
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 4000,
+        system: TAILOR_RESUME_SYSTEM_PROMPT,
+        messages: [{ role: "user", content: userMessage }]
+      }),
+      signal: controller.signal
+    });
+  } catch (networkErr) {
+    if (networkErr.name === "AbortError") {
+      return { success: false, error: `The request to Claude timed out after ${API_TIMEOUT_MS / 1000} seconds. Try again.` };
+    }
+    return { success: false, error: "Network error reaching the Anthropic API. Check your internet connection and try again." };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (!response.ok) {
+    if (response.status === 401) {
+      return { success: false, error: "Anthropic API key was rejected (401). Double-check the key saved in the popup settings." };
+    }
+    if (response.status === 429) {
+      return { success: false, error: "Rate limited by the Anthropic API (429). Wait a moment and try again." };
+    }
+    let bodyText = "";
+    try {
+      const errJson = await response.json();
+      bodyText = errJson?.error?.message || "";
+    } catch (_) {}
+    return { success: false, error: `Anthropic API request failed (${response.status}). ${bodyText}`.trim() };
+  }
+
+  let data;
+  try {
+    data = await response.json();
+  } catch (parseErr) {
+    return { success: false, error: "Could not parse the response from the Anthropic API." };
+  }
+
+  const content = Array.isArray(data.content) ? data.content : [];
+  const fullText = content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n")
+    .trim();
+
+  const match = fullText.match(/<resume_json>([\s\S]*?)<\/resume_json>/);
+  const jsonText = match ? match[1].trim() : fullText.trim();
+
+  if (!jsonText) {
+    return { success: false, error: "Claude returned an empty response. This can happen if the request was declined — try again." };
+  }
+
+  let tailoredResumeJson;
+  try {
+    tailoredResumeJson = JSON.parse(jsonText);
+  } catch (parseErr) {
+    return { success: false, error: "Claude's response wasn't valid JSON, so the tailored resume couldn't be parsed. Try again." };
+  }
+
+  // Belt-and-suspenders: guarantee these pass through unchanged regardless of
+  // what the model actually did, since sourceFilename in particular feeds
+  // the download filename downstream.
+  tailoredResumeJson.sourceFilename = resumeJson.sourceFilename || tailoredResumeJson.sourceFilename || "";
+
+  return { success: true, resumeJson: tailoredResumeJson };
+}
+
+const COMPRESS_RESUME_SYSTEM_PROMPT = `You are tightening an already-tailored resume so it fits on one printed page. This is a compression pass only, not a rewrite.
+
+Rules:
+- Shorten each bullet by roughly 15%, preserving every keyword and the specific metric/number it already contains — the goal is tighter phrasing, not less substance.
+- Never remove a bullet entirely, never merge two bullets into one, never drop an experience or project entry, never drop a skill.
+- Do not introduce any new claim, skill, tool, or accomplishment not already present in the input.
+- No em dashes (—) anywhere in the output.
+- Do not change "name", "contact", "education", or "sourceFilename" — pass them through unchanged.
+
+CRITICAL OUTPUT FORMAT: wrap the result in <resume_json></resume_json> tags with absolutely nothing else inside those tags except the raw JSON object, same schema as the input. Everything outside the tags is discarded.`;
+
+async function compressResume({ resumeJson }) {
+  const stored = await chrome.storage.local.get(["apiKey"]);
+  const { apiKey } = stored;
+
+  if (!apiKey) {
+    return { success: false, error: "No Anthropic API key saved. Open the extension popup and add your API key in settings." };
+  }
+  if (!resumeJson || !resumeJson.name) {
+    return { success: false, error: "No resume to compress." };
+  }
+
+  const userMessage = `<resume_json>
+${JSON.stringify(resumeJson)}
+</resume_json>
+
+Tighten the bullets now by about 15%, following the system instructions exactly.`;
+
+  let response;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true"
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 4000,
+        system: COMPRESS_RESUME_SYSTEM_PROMPT,
+        messages: [{ role: "user", content: userMessage }]
+      }),
+      signal: controller.signal
+    });
+  } catch (networkErr) {
+    if (networkErr.name === "AbortError") {
+      return { success: false, error: `The request to Claude timed out after ${API_TIMEOUT_MS / 1000} seconds. Try again.` };
+    }
+    return { success: false, error: "Network error reaching the Anthropic API. Check your internet connection and try again." };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (!response.ok) {
+    if (response.status === 401) {
+      return { success: false, error: "Anthropic API key was rejected (401). Double-check the key saved in the popup settings." };
+    }
+    if (response.status === 429) {
+      return { success: false, error: "Rate limited by the Anthropic API (429). Wait a moment and try again." };
+    }
+    let bodyText = "";
+    try {
+      const errJson = await response.json();
+      bodyText = errJson?.error?.message || "";
+    } catch (_) {}
+    return { success: false, error: `Anthropic API request failed (${response.status}). ${bodyText}`.trim() };
+  }
+
+  let data;
+  try {
+    data = await response.json();
+  } catch (parseErr) {
+    return { success: false, error: "Could not parse the response from the Anthropic API." };
+  }
+
+  const content = Array.isArray(data.content) ? data.content : [];
+  const fullText = content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n")
+    .trim();
+
+  const match = fullText.match(/<resume_json>([\s\S]*?)<\/resume_json>/);
+  const jsonText = match ? match[1].trim() : fullText.trim();
+
+  if (!jsonText) {
+    return { success: false, error: "Claude returned an empty response while compressing the resume." };
+  }
+
+  let compressedResumeJson;
+  try {
+    compressedResumeJson = JSON.parse(jsonText);
+  } catch (parseErr) {
+    return { success: false, error: "Claude's compression response wasn't valid JSON." };
+  }
+
+  compressedResumeJson.sourceFilename = resumeJson.sourceFilename || compressedResumeJson.sourceFilename || "";
+
+  return { success: true, resumeJson: compressedResumeJson };
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "GENERATE_COVER_LETTER") {
     generateCoverLetter(message)
@@ -459,6 +706,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message?.type === "ANALYZE_RESUME_SKILLS") {
     analyzeResumeSkills(message)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: `Unexpected error: ${err.message}` }));
+    return true;
+  }
+  if (message?.type === "TAILOR_RESUME") {
+    tailorResume(message)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: `Unexpected error: ${err.message}` }));
+    return true;
+  }
+  if (message?.type === "COMPRESS_RESUME") {
+    compressResume(message)
       .then(sendResponse)
       .catch((err) => sendResponse({ success: false, error: `Unexpected error: ${err.message}` }));
     return true;
